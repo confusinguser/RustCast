@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RustCast</title>
+  <!-- React + Babel from CDN: needs internet the first time. Served same-origin
+       as the API, so fetch() calls need no CORS. -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1115; color: #e6e8ec;
+    }
+    .wrap { max-width: 680px; margin: 0 auto; padding: 32px 20px 64px; }
+    header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 24px; }
+    h1 { font-size: 24px; margin: 0; letter-spacing: -0.02em; }
+    .sub { color: #8b909a; font-size: 13px; }
+    .card {
+      background: #171a21; border: 1px solid #262b36; border-radius: 12px;
+      padding: 16px 18px; margin-bottom: 12px;
+    }
+    .row { display: flex; align-items: center; gap: 12px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+    .dot.on { background: #35d07f; box-shadow: 0 0 8px #35d07f88; }
+    .dot.off { background: #545a66; }
+    .ip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px; }
+    .meta { color: #8b909a; font-size: 12px; margin-left: auto; }
+    .slider-row { display: flex; align-items: center; gap: 14px; margin-top: 14px; }
+    .label { width: 38px; font-size: 12px; color: #8b909a; flex: none; }
+    input[type=range] { flex: 1; accent-color: #4c8bf5; height: 4px; }
+    .pct { width: 44px; text-align: right; font-variant-numeric: tabular-nums; font-size: 14px; color: #c7ccd6; }
+    .empty { color: #8b909a; text-align: center; padding: 48px 0; }
+    .err { color: #ff6b6b; font-size: 13px; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // PUT a client setting, debounced per (ip, field) so dragging a slider
+    // doesn't flood the server.
+    function useDebouncedPut() {
+      const timers = useRef({});
+      return useCallback((ip, field, body) => {
+        const key = ip + ":" + field;
+        clearTimeout(timers.current[key]);
+        timers.current[key] = setTimeout(() => {
+          fetch(`/api/clients/${ip}/${field}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }).catch(() => {});
+        }, 120);
+      }, []);
+    }
+
+    function Client({ c, volume, delay, onVolume, onDelay }) {
+      return (
+        <div className="card">
+          <div className="row">
+            <span className={"dot " + (c.connected ? "on" : "off")}></span>
+            <span className="ip">{c.ip}</span>
+            <span className="meta">
+              {c.connected ? "connected" : `last seen ${c.seconds_ago}s ago`}
+            </span>
+          </div>
+          <div className="slider-row">
+            <span className="label">Vol</span>
+            <input
+              type="range" min="0" max="100" value={Math.round(volume * 100)}
+              onChange={(e) => onVolume(c.ip, Number(e.target.value) / 100)}
+            />
+            <span className="pct">{Math.round(volume * 100)}%</span>
+          </div>
+          <div className="slider-row">
+            <span className="label">Delay</span>
+            <input
+              type="range" min="0" max="150" step="5" value={delay}
+              onChange={(e) => onDelay(c.ip, Number(e.target.value))}
+            />
+            <span className="pct">{delay}ms</span>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [clients, setClients] = useState([]);
+      const [volumes, setVolumes] = useState({}); // ip -> 0..1, UI source of truth
+      const [delays, setDelays] = useState({});   // ip -> ms, UI source of truth
+      const [error, setError] = useState(null);
+      const putSetting = useDebouncedPut();
+
+      // Poll the client list once a second.
+      useEffect(() => {
+        let alive = true;
+        const tick = async () => {
+          try {
+            const res = await fetch("/api/clients");
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            const list = await res.json();
+            if (!alive) return;
+            setClients(list);
+            setError(null);
+            // Seed values for clients we haven't seen yet; keep local value for
+            // ones already on screen so the slider doesn't jump while adjusting.
+            setVolumes((prev) => {
+              const next = { ...prev };
+              for (const c of list) if (!(c.ip in next)) next[c.ip] = c.volume;
+              return next;
+            });
+            setDelays((prev) => {
+              const next = { ...prev };
+              for (const c of list) if (!(c.ip in next)) next[c.ip] = c.delay_ms;
+              return next;
+            });
+          } catch (e) {
+            if (alive) setError("Can't reach server: " + e.message);
+          }
+        };
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => { alive = false; clearInterval(id); };
+      }, []);
+
+      const onVolume = (ip, v) => {
+        setVolumes((prev) => ({ ...prev, [ip]: v }));
+        putSetting(ip, "volume", { volume: v });
+      };
+
+      const onDelay = (ip, ms) => {
+        setDelays((prev) => ({ ...prev, [ip]: ms }));
+        putSetting(ip, "delay", { delay_ms: ms });
+      };
+
+      return (
+        <div className="wrap">
+          <header>
+            <h1>RustCast</h1>
+            <span className="sub">{clients.length} client{clients.length === 1 ? "" : "s"}</span>
+          </header>
+          {error && <div className="err">{error}</div>}
+          {clients.length === 0 && !error && (
+            <div className="empty">No clients connected yet.</div>
+          )}
+          {clients.map((c) => (
+            <Client
+              key={c.ip} c={c}
+              volume={volumes[c.ip] ?? c.volume}
+              delay={delays[c.ip] ?? c.delay_ms}
+              onVolume={onVolume} onDelay={onDelay}
+            />
+          ))}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

@@ -6,10 +6,11 @@
 //! continuously-corrected estimate of the server's clock that playback
 //! schedules against — no external NTP daemon required.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::wire::{TimeRequest, TimeResponse, now_epoch_ms};
 
@@ -23,7 +24,9 @@ const MAX_SLEW_FRACTION: f64 = 0.005;
 /// Number of quick exchanges to do before settling into the steady interval.
 const WARMUP_SAMPLES: usize = 8;
 const WARMUP_INTERVAL_MS: u64 = 150;
-const STEADY_INTERVAL_MS: u64 = 2000;
+/// Steady sync cadence. Also bounds how quickly a volume change (piggybacked on
+/// the response) reaches a client, so we keep it fairly brisk.
+const STEADY_INTERVAL_MS: u64 = 500;
 
 #[derive(Clone, Copy)]
 struct Sample {
@@ -120,9 +123,177 @@ impl Default for SyncedClock {
     }
 }
 
+/// A latch holding the latest server-assigned volume, written by the sync
+/// thread and consumed by the playback loop.
+pub struct VolumeCell {
+    inner: Mutex<VolumeState>,
+}
+
+struct VolumeState {
+    value: f32,
+    dirty: bool,
+}
+
+impl VolumeCell {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(VolumeState {
+                value: 1.0,
+                dirty: false,
+            }),
+        }
+    }
+
+    /// Record a new target volume; marks it dirty only if it actually changed.
+    pub fn set(&self, value: f32) {
+        let mut s = self.inner.lock().unwrap();
+        if (value - s.value).abs() > f32::EPSILON {
+            s.value = value;
+            s.dirty = true;
+        }
+    }
+
+    /// Return the volume if it changed since the last call, clearing the flag.
+    pub fn take_update(&self) -> Option<f32> {
+        let mut s = self.inner.lock().unwrap();
+        if s.dirty {
+            s.dirty = false;
+            Some(s.value)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for VolumeCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A client that has recently contacted the server for time-sync.
+struct ClientEntry {
+    last_seen: Instant,
+    volume: f32,
+    delay_ms: u32,
+}
+
+/// The per-client settings returned to a client on each sync.
+#[derive(Clone, Copy)]
+pub struct ClientSettings {
+    pub volume: f32,
+    pub delay_ms: u32,
+}
+
+/// Snapshot of one client for the HTTP API.
+pub struct ClientStatus {
+    pub ip: Ipv4Addr,
+    pub seconds_ago: f64,
+    pub volume: f32,
+    pub delay_ms: u32,
+    pub connected: bool,
+}
+
+/// Server-side registry of connected clients and their assigned volumes.
+/// Populated from time-sync traffic and read/written by the HTTP API.
+pub struct ClientRegistry {
+    clients: Mutex<HashMap<Ipv4Addr, ClientEntry>>,
+}
+
+impl ClientRegistry {
+    /// A client is "connected" if seen within this window.
+    const CONNECTED_SECS: f64 = 5.0;
+    /// Forget clients not seen for this long, so the list doesn't grow forever.
+    const STALE_SECS: f64 = 60.0;
+    /// Max playback advance. Must stay comfortably below the server's send lead
+    /// (SEND_LEAD_MS): a client can only skip forward into audio it has already
+    /// buffered, and needs headroom left over to absorb jitter.
+    pub const MAX_DELAY_MS: u32 = 150;
+
+    pub fn new() -> Self {
+        Self {
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Mark `ip` as seen now, creating it (defaults) if new. Returns its current
+    /// assigned settings, for the sync response.
+    pub fn touch(&self, ip: Ipv4Addr) -> ClientSettings {
+        let mut map = self.clients.lock().unwrap();
+        let entry = map.entry(ip).or_insert(ClientEntry {
+            last_seen: Instant::now(),
+            volume: 1.0,
+            delay_ms: 0,
+        });
+        entry.last_seen = Instant::now();
+        ClientSettings {
+            volume: entry.volume,
+            delay_ms: entry.delay_ms,
+        }
+    }
+
+    /// Set a client's volume. No-op if the client isn't known.
+    pub fn set_volume(&self, ip: Ipv4Addr, volume: f32) -> bool {
+        let mut map = self.clients.lock().unwrap();
+        if let Some(entry) = map.get_mut(&ip) {
+            entry.volume = volume.clamp(0.0, 1.0);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a client's playback advance (ms earlier than play_at). No-op if the
+    /// client isn't known.
+    pub fn set_delay(&self, ip: Ipv4Addr, delay_ms: u32) -> bool {
+        let mut map = self.clients.lock().unwrap();
+        if let Some(entry) = map.get_mut(&ip) {
+            entry.delay_ms = delay_ms.min(Self::MAX_DELAY_MS);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Current clients, dropping any that have gone stale.
+    pub fn snapshot(&self) -> Vec<ClientStatus> {
+        let mut map = self.clients.lock().unwrap();
+        let now = Instant::now();
+        map.retain(|_, e| now.duration_since(e.last_seen).as_secs_f64() < Self::STALE_SECS);
+        let mut out: Vec<ClientStatus> = map
+            .iter()
+            .map(|(ip, e)| {
+                let secs = now.duration_since(e.last_seen).as_secs_f64();
+                ClientStatus {
+                    ip: *ip,
+                    seconds_ago: secs,
+                    volume: e.volume,
+                    delay_ms: e.delay_ms,
+                    connected: secs < Self::CONNECTED_SECS,
+                }
+            })
+            .collect();
+        out.sort_by_key(|c| c.ip.octets());
+        out
+    }
+}
+
+impl Default for ClientRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Client side: repeatedly exchange timestamps with the server and feed the
-/// results into `clock`. Runs forever; intended to live on its own thread.
-pub fn run_client_sync(server_ip: Ipv4Addr, sync_port: u16, clock: Arc<SyncedClock>) {
+/// results into `clock`, applying any volume the server sends back to `volume`.
+/// Runs forever; intended to live on its own thread.
+pub fn run_client_sync(
+    server_ip: Ipv4Addr,
+    sync_port: u16,
+    clock: Arc<SyncedClock>,
+    volume: Arc<VolumeCell>,
+    delay_ms: Arc<AtomicU32>,
+) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(s) => s,
         Err(e) => {
@@ -156,6 +327,8 @@ pub fn run_client_sync(server_ip: Ipv4Addr, sync_port: u16, clock: Arc<SyncedClo
                     // offset = server_clock − midpoint of the client send/recv.
                     let offset = resp.server_ms as f64 - (t1 as f64 + t4 as f64) / 2.0;
                     clock.add_sample(offset, rtt);
+                    volume.set(resp.volume);
+                    delay_ms.store(resp.delay_ms, Ordering::Relaxed);
                 }
             }
         }
@@ -169,9 +342,10 @@ pub fn run_client_sync(server_ip: Ipv4Addr, sync_port: u16, clock: Arc<SyncedClo
     }
 }
 
-/// Server side: answer time-sync requests with the current server clock. Runs
-/// forever; intended to live on its own thread.
-pub fn run_server_responder(sync_port: u16) {
+/// Server side: answer time-sync requests with the current server clock, and
+/// register the requesting client / return its assigned volume. Runs forever;
+/// intended to live on its own thread.
+pub fn run_server_responder(sync_port: u16, registry: Arc<ClientRegistry>) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, sync_port)) {
         Ok(s) => s,
         Err(e) => {
@@ -184,10 +358,20 @@ pub fn run_server_responder(sync_port: u16) {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 if let Ok(req) = bincode::deserialize::<TimeRequest>(&buf[..n]) {
+                    // Register the client (by IP) and read back its settings.
+                    let settings = match from {
+                        std::net::SocketAddr::V4(v4) => registry.touch(*v4.ip()),
+                        _ => ClientSettings {
+                            volume: 1.0,
+                            delay_ms: 0,
+                        },
+                    };
                     let resp = TimeResponse {
                         client_send_ms: req.client_send_ms,
                         server_ms: now_epoch_ms(),
                         nonce: req.nonce,
+                        volume: settings.volume,
+                        delay_ms: settings.delay_ms,
                     };
                     if let Ok(bytes) = bincode::serialize(&resp) {
                         let _ = sock.send_to(&bytes, from);

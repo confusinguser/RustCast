@@ -33,6 +33,11 @@ pub fn play(mut source: impl AudioSource) {
     let sample_rate = SampleRate::new(fmt.sample_rate).expect("sample_rate must be > 0");
 
     loop {
+        // Apply any remotely-driven volume change (network source only).
+        if let Some(vol) = source.take_volume_update() {
+            player.set_volume(vol);
+        }
+
         match source.next_samples() {
             Ok(Some(samples)) if samples.is_empty() => continue,
             Ok(Some(samples)) => {

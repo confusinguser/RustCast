@@ -11,11 +11,16 @@ use std::process::exit;
 use rustcast::source::librespot::LibrespotSource;
 use rustcast::source::pipe::PipeSource;
 use rustcast::source::{AudioSource, Format};
-use rustcast::sync::run_server_responder;
+use std::sync::Arc;
+use rustcast::api;
+use rustcast::sync::{ClientRegistry, run_server_responder};
 use rustcast::wire::{
     AudioPacket, DEFAULT_GROUP, DEFAULT_PORT, DEFAULT_SYNC_PORT, TARGET_PCM_BYTES, WireFormat,
     now_epoch_ms,
 };
+
+/// Port for the HTTP control API + web UI.
+const HTTP_PORT: u16 = 8080;
 
 // Pipe kernel-buffer size (see PipeSource): ~46ms at 44.1 kHz stereo s16le.
 const PIPE_BYTES: i32 = 8 * 1024;
@@ -40,6 +45,19 @@ fn main() {
         eprintln!("unknown wire format '{format_arg}' (expected 's16' or 'f32')");
         exit(1);
     });
+
+    // Shared client registry, populated by the time-sync responder and
+    // read/written by the HTTP API. Start both before opening the source so the
+    // control UI is reachable immediately.
+    let registry = Arc::new(ClientRegistry::new());
+    {
+        let reg = registry.clone();
+        std::thread::spawn(move || api::run(reg, HTTP_PORT));
+    }
+    {
+        let reg = registry.clone();
+        std::thread::spawn(move || run_server_responder(DEFAULT_SYNC_PORT, reg));
+    }
 
     let mut source: Box<dyn AudioSource> = match source_kind.as_str() {
         "pipe" => {
@@ -76,9 +94,6 @@ fn main() {
     }
     let dest = (DEFAULT_GROUP, DEFAULT_PORT);
 
-    // Answer clients' time-sync requests on a background thread.
-    std::thread::spawn(|| run_server_responder(DEFAULT_SYNC_PORT));
-
     // Frames per datagram, sized to keep the PCM payload under TARGET_PCM_BYTES.
     let frames_per_packet = (TARGET_PCM_BYTES / (channels * wire_fmt.bytes_per_sample())).max(1);
     let samples_per_packet = frames_per_packet * channels;
@@ -88,9 +103,11 @@ fn main() {
         DEFAULT_GROUP, DEFAULT_PORT
     );
 
-    // The stream timeline is anchored once, so a packet's play time depends only
-    // on its sample offset — independent of send jitter.
-    let start_ms = now_epoch_ms();
+    // Timeline anchor: play_at = start_ms + lead + frames/rate. `start_ms` is
+    // re-anchored to real time whenever the source falls behind (a late start
+    // like Spotify connecting minutes later, or a pause/gap), so play_at always
+    // stays ~lead in the future instead of drifting into the past.
+    let mut start_ms = now_epoch_ms();
     let mut seq: u64 = 0;
     let mut total_frames: u64 = 0;
     let mut pending: Vec<f32> = Vec::with_capacity(samples_per_packet * 2);
@@ -98,7 +115,7 @@ fn main() {
     loop {
         match source.next_samples() {
             Ok(Some(samples)) => pending.extend_from_slice(&samples),
-            Ok(None) => break, // source ended
+            Ok(None) => continue, // source ended
             Err(e) => {
                 eprintln!("source error: {e}");
                 break;
@@ -113,9 +130,15 @@ fn main() {
             // to realtime so a bursty source can't outrun the timeline and
             // bloat client buffers.
             let offset_ms = total_frames * 1000 / sample_rate;
+            let now = now_epoch_ms();
+            // Re-anchor if the timeline has fallen behind real time (source
+            // started late or paused). Without this, play_at would be in the
+            // past and clients would drop every packet as "too late".
+            if start_ms + offset_ms < now {
+                start_ms = now - offset_ms;
+            }
             let play_at_ms = start_ms + SEND_LEAD_MS + offset_ms;
             let send_at_ms = start_ms + offset_ms;
-            let now = now_epoch_ms();
             if send_at_ms > now {
                 std::thread::sleep(std::time::Duration::from_millis(send_at_ms - now));
             }

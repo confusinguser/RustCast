@@ -110,6 +110,13 @@ pub struct TimeResponse {
     /// Server's local clock (epoch ms) when it answered (≈ T2 ≈ T3).
     pub server_ms: u64,
     pub nonce: u64,
+    /// This client's currently-assigned playback volume (0.0..=1.0), so volume
+    /// changes ride along with the periodic sync exchange.
+    pub volume: f32,
+    /// This client's playback advance in milliseconds: the client plays each
+    /// packet this much *earlier* than its `play_at`, to compensate for the
+    /// latency between this computer and its speaker.
+    pub delay_ms: u32,
 }
 
 /// Current local wall-clock time as UNIX-epoch milliseconds. On the client this

@@ -22,4 +22,11 @@ pub trait AudioSource {
     /// Pull the next block of samples. `Ok(None)` signals end of stream.
     /// May block until samples are available.
     fn next_samples(&mut self) -> io::Result<Option<Vec<f32>>>;
+
+    /// Return a pending output-volume change (linear gain, 1.0 = unity) if one
+    /// is available, else `None`. Lets a source drive volume remotely (the
+    /// network source applies the server-assigned volume here). Default: none.
+    fn take_volume_update(&mut self) -> Option<f32> {
+        None
+    }
 }

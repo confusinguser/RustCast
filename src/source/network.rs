@@ -11,12 +11,12 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::sync::{SyncedClock, run_client_sync};
+use crate::sync::{SyncedClock, VolumeCell, run_client_sync};
 use crate::wire::{AudioPacket, DEFAULT_SYNC_PORT};
 
 use super::{AudioSource, Format};
@@ -32,6 +32,12 @@ const MAX_SLEEP_MS: u64 = 2000;
 /// How long `new()` waits for the first clock estimate before starting anyway
 /// (falling back to a zero offset, i.e. assuming already-synced clocks).
 const SYNC_WARMUP_TIMEOUT_MS: u64 = 1500;
+/// If a packet is already this many ms past its (delay-adjusted) play time, we
+/// drop it rather than play it late. This is what advances our stream position
+/// so a delay increase actually plays earlier, and it bounds output latency
+/// against clock drift. A hair above one packet, so steady-state pacing (which
+/// never runs late) doesn't nuisance-drop.
+const LATE_DROP_MS: f64 = 8.0;
 
 struct Shared {
     buf: Mutex<BTreeMap<u64, AudioPacket>>,
@@ -44,6 +50,10 @@ struct Shared {
 pub struct NetworkSource {
     shared: Arc<Shared>,
     clock: Arc<SyncedClock>,
+    volume: Arc<VolumeCell>,
+    /// Playback advance in ms: each packet is played this much earlier than its
+    /// `play_at`, to compensate for this device's speaker latency.
+    delay_ms: Arc<AtomicU32>,
     format: Format,
     /// Next sequence number we expect to play.
     next_seq: u64,
@@ -63,6 +73,8 @@ impl NetworkSource {
             server_ip: Mutex::new(None),
         });
         let clock = Arc::new(SyncedClock::new());
+        let volume = Arc::new(VolumeCell::new());
+        let delay_ms = Arc::new(AtomicU32::new(0));
 
         let receiver = {
             let shared = shared.clone();
@@ -92,9 +104,11 @@ impl NetworkSource {
         let server_ip = *shared.server_ip.lock().unwrap();
         let sync = server_ip.map(|ip| {
             let clock = clock.clone();
+            let volume = volume.clone();
+            let delay_ms = delay_ms.clone();
             thread::Builder::new()
                 .name("time-sync".into())
-                .spawn(move || run_client_sync(ip, DEFAULT_SYNC_PORT, clock))
+                .spawn(move || run_client_sync(ip, DEFAULT_SYNC_PORT, clock, volume, delay_ms))
                 .expect("spawn time-sync thread")
         });
         if server_ip.is_none() {
@@ -110,6 +124,8 @@ impl NetworkSource {
         Ok(Self {
             shared,
             clock,
+            volume,
+            delay_ms,
             format: Format {
                 channels: first.channels,
                 sample_rate: first.sample_rate,
@@ -174,23 +190,41 @@ impl AudioSource for NetworkSource {
         self.format
     }
 
+    fn take_volume_update(&mut self) -> Option<f32> {
+        self.volume.take_update()
+    }
+
     fn next_samples(&mut self) -> io::Result<Option<Vec<f32>>> {
-        let pkt = match self.pull_next() {
-            Some(p) => p,
-            None => return Ok(None),
-        };
+        let delay = self.delay_ms.load(Ordering::Relaxed) as f64;
+        loop {
+            let pkt = match self.pull_next() {
+                Some(p) => p,
+                None => return Ok(None),
+            };
 
-        // Hold the packet until its scheduled play time, measured on the synced
-        // server clock. Because we keep the output queue near-empty, appending
-        // at ~play_at means it plays at ~play_at on every client.
-        let server_now = self.clock.server_now_ms();
-        let wait = pkt.play_at_ms as f64 - server_now;
-        if wait > 0.0 {
-            let wait_ms = (wait as u64).min(MAX_SLEEP_MS);
-            thread::sleep(Duration::from_millis(wait_ms));
+            // Target wall-clock time (on the synced server clock) to hand this
+            // packet to the device. The per-device delay pulls it earlier to
+            // compensate for local speaker latency.
+            let target = pkt.play_at_ms as f64 - delay;
+            let ahead = target - self.clock.server_now_ms();
+
+            if ahead < -LATE_DROP_MS {
+                // Already past its play time: drop it and advance to the next
+                // packet. This keeps the output queue near-empty (so append
+                // time ≈ output time) and is what makes a larger delay actually
+                // skip the stream forward and play earlier.
+                continue;
+            }
+
+            if ahead > 0.0 {
+                // Early: wait until it's due. Waiting past what's buffered lets
+                // the queue drain (brief silence) — which is how a *smaller*
+                // delay plays later.
+                thread::sleep(Duration::from_millis((ahead as u64).min(MAX_SLEEP_MS)));
+            }
+
+            return Ok(Some(pkt.format.decode(&pkt.data)));
         }
-
-        Ok(Some(pkt.format.decode(&pkt.data)))
     }
 }
 
