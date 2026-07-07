@@ -1,0 +1,31 @@
+[package]
+name = "RustCast2"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rustcast"
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+rodio = "0.22.2"
+libc = "0.2.186"
+# Spotify Connect receiver. We supply our own audio sink, so no playback
+# backend is needed; libmdns is a pure-Rust zeroconf backend and
+# rustls-tls-native-roots avoids an OpenSSL system dependency.
+librespot = { version = "0.8.0", default-features = false, features = [
+    "with-libmdns",
+    "rustls-tls-native-roots",
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
