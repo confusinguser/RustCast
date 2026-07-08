@@ -22,9 +22,9 @@ const DEVICE_BUFFER_FRAMES: u32 = 512; // ~11ms at 44.1 kHz
 // Hard cap on the rodio output-queue depth, in appended blocks. Kept short so
 // that raising the delay skips the stream forward rather than piling audio into
 // the output queue: once the queue is this deep we drop the new block instead
-// of appending it, keeping output latency bounded. ~8 blocks leaves a couple of
+// of appending it, keeping output latency bounded. ~12 blocks leaves a couple of
 // device-buffer callbacks of headroom against underrun while staying tight.
-const MAX_QUEUED_BUFFERS: usize = 8;
+const MAX_QUEUED_BUFFERS: usize = 12;
 
 fn main() {
     // Optional local interface IP to receive multicast on (for multi-homed

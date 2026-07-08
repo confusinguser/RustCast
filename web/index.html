@@ -114,18 +114,18 @@
     // markers over a rolling [now-WINDOW_MS, now] window. Redraws on every
     // animation frame with a live right edge, so it scrolls smoothly and keeps
     // moving even when no new data arrives from the backend.
-    function Graph({ title, series, markers = [], clockOffset = 0, height = 96, unit = "" }) {
+    function Graph({ title, series, markers = [], clockOffset = 0, height = 96, unit = "", signed = false }) {
       const ref = useRef(null);
       // Latest inputs, read fresh by the animation loop each frame.
-      const data = useRef({ series, markers, clockOffset, height });
-      data.current = { series, markers, clockOffset, height };
+      const data = useRef({ series, markers, clockOffset, height, signed });
+      data.current = { series, markers, clockOffset, height, signed };
 
       useEffect(() => {
         let raf = 0;
         const draw = () => {
         const cv = ref.current;
         if (!cv) { raf = requestAnimationFrame(draw); return; }
-        const { series, markers, clockOffset, height: h } = data.current;
+        const { series, markers, clockOffset, height: h, signed } = data.current;
         const dpr = window.devicePixelRatio || 1;
         const w = cv.clientWidth || 600;
         cv.width = w * dpr;
@@ -138,29 +138,56 @@
         // Live right edge = current server time; advances every frame so the
         // window scrolls left continuously, data or not.
         const x1 = Date.now() + clockOffset, x0 = x1 - WINDOW_MS;
-        let yMax = 0;
-        for (const s of series) for (const p of s.points) if (p.x >= x0 && p.y > yMax) yMax = p.y;
-        yMax = yMax <= 0 ? 1 : yMax * 1.15;
+        // Auto-scale y. Signed graphs (e.g. clock offset) include 0 and allow
+        // negatives; unsigned graphs stay pinned to a 0 baseline.
+        let dataMin = Infinity, dataMax = -Infinity;
+        for (const s of series) for (const p of s.points) {
+          if (p.x < x0) continue;
+          if (p.y < dataMin) dataMin = p.y;
+          if (p.y > dataMax) dataMax = p.y;
+        }
+        if (dataMax < dataMin) { dataMin = 0; dataMax = 1; }
+        let yMin, yMax;
+        if (signed) {
+          yMax = Math.max(dataMax, 0);
+          yMin = Math.min(dataMin, 0);
+          const span = (yMax - yMin) || 1;
+          yMax = yMax + span * 0.1;
+          yMin = yMin - span * 0.1;
+        } else {
+          yMin = 0;
+          yMax = dataMax > 0 ? dataMax * 1.15 : 1;
+        }
 
         const sx = (x) => padL + ((x - x0) / (x1 - x0)) * (w - padL - padR);
-        const sy = (y) => (h - padB) - (y / yMax) * (h - padT - padB);
+        const sy = (y) => (h - padB) - ((y - yMin) / (yMax - yMin)) * (h - padT - padB);
 
-        // grid + y labels (0, mid, max)
+        // grid + y labels (min, mid, max)
         ctx.font = "10px ui-monospace, monospace";
         ctx.textBaseline = "middle";
         ctx.lineWidth = 1;
         for (const frac of [0, 0.5, 1]) {
-          const val = yMax * frac;
+          const val = yMin + (yMax - yMin) * frac;
           const y = sy(val);
           ctx.strokeStyle = C.grid;
           ctx.beginPath();
           ctx.moveTo(padL, y);
           ctx.lineTo(w - padR, y);
           ctx.stroke();
-          const lbl = val >= 100 ? Math.round(val) : val >= 10 ? val.toFixed(0) : val.toFixed(1);
+          const av = Math.abs(val);
+          const lbl = av >= 100 ? val.toFixed(0) : av >= 10 ? val.toFixed(1) : val.toFixed(2);
           ctx.fillStyle = C.axis;
           ctx.textAlign = "right";
           ctx.fillText(lbl, padL - 4, y);
+        }
+        // Emphasized zero line for signed graphs straddling 0.
+        if (signed && yMin < 0 && yMax > 0) {
+          const yz = sy(0);
+          ctx.strokeStyle = C.axis;
+          ctx.beginPath();
+          ctx.moveTo(padL, yz);
+          ctx.lineTo(w - padR, yz);
+          ctx.stroke();
         }
         // x axis ticks
         ctx.fillStyle = C.axis;
@@ -306,6 +333,24 @@
             <span className="legend"><span className="swatch" style={{ background: C.drop }}></span>drop (overrun/late/lost)</span>
             <span className="legend"><span className="swatch" style={{ background: C.under }}></span>underrun</span>
           </div>
+          <div className="readouts" style={{ marginTop: 12 }}>
+            <div className="stat"><span className="k">Clock offset</span><span className="v">{(latest.clock_offset_ms || 0).toFixed(2)} ms</span></div>
+            <div className="stat"><span className="k">Target offset</span><span className="v">{(latest.clock_target_offset_ms || 0).toFixed(2)} ms</span></div>
+            <div className="stat"><span className="k">Last Sample</span><span className="v">{(latest.last_offset_ms || 0).toFixed(2)} ms ({(latest.last_rtt_ms || 0).toFixed(1)} ms)</span></div>
+            <div className="stat"><span className="k">RTT</span><span className="v">{(latest.rtt_ms || 0).toFixed(1)} ms</span></div>
+            <div className="stat"><span className="k">Sync samples</span><span className="v">{latest.sync_samples || 0}</span></div>
+          </div>
+          <Graph
+            title="Clock offset vs client" unit="server − client, ms" clockOffset={clockOffset} signed height={110}
+            series={[
+              { name: "applied", color: C.rate, points: gaugeSeries(samples, "clock_offset_ms") },
+              { name: "target", color: C.jitter, points: gaugeSeries(samples, "clock_target_offset_ms") },
+            ]}
+          />
+          <Graph
+            title="Sync round-trip time" unit="ms" clockOffset={clockOffset}
+            series={[{ name: "rtt", color: C.send, points: gaugeSeries(samples, "rtt_ms") }]}
+          />
         </div>
       );
     }

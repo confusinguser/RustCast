@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::metrics::DeviceMetrics;
 use crate::wire::{SettingsRequest, SettingsResponse, TimeRequest, TimeResponse, now_epoch_ms};
 
 /// How many recent measurements to keep when choosing the best offset.
-const SAMPLE_WINDOW: usize = 16;
+const SAMPLE_WINDOW: usize = 64;
 /// Maximum rate at which the *applied* offset may move toward the target, as a
 /// fraction of real time (0.005 = 0.5%). Keeps the induced tempo/pitch change
 /// well below the threshold of perception while still tracking drift.
@@ -24,8 +25,7 @@ const MAX_SLEW_FRACTION: f64 = 0.005;
 /// Number of quick exchanges to do before settling into the steady interval.
 const WARMUP_SAMPLES: usize = 8;
 const WARMUP_INTERVAL_MS: u64 = 150;
-/// Steady sync cadence. Also bounds how quickly a volume change (piggybacked on
-/// the response) reaches a client, so we keep it fairly brisk.
+/// Steady sync cadence
 const STEADY_INTERVAL_MS: u64 = 500;
 /// Fallback poll / keepalive interval. The server pushes changes instantly, so
 /// this only recovers a missed push and refreshes the client's address.
@@ -45,6 +45,23 @@ struct State {
     applied_offset_ms: f64,
     last_local_ms: f64,
     initialized: bool,
+}
+
+/// A snapshot of the clock-sync state, for telemetry.
+#[derive(Clone, Copy)]
+pub struct SyncStats {
+    /// Applied offset (server_clock - client_clock), ms; what playback uses.
+    pub applied_offset_ms: f64,
+    /// Best offset estimate, ms (lowest-RTT sample in the window).
+    pub target_offset_ms: f64,
+    /// Lowest RTT in the window, ms.
+    pub best_rtt_ms: f64,
+    /// Raw offset from the most recent NTP exchange, ms (before lowest-RTT pick).
+    pub last_offset_ms: f64,
+    /// RTT of the most recent NTP exchange, ms.
+    pub last_rtt_ms: f64,
+    /// Number of samples currently held.
+    pub samples: usize,
 }
 
 /// A continuously-corrected estimate of the server's clock.
@@ -100,6 +117,27 @@ impl SyncedClock {
 
     pub fn sample_count(&self) -> usize {
         self.state.lock().unwrap().samples.len()
+    }
+
+    /// Current sync state for telemetry.
+    pub fn stats(&self) -> SyncStats {
+        let s = self.state.lock().unwrap();
+        let best_rtt = s
+            .samples
+            .iter()
+            .map(|x| x.rtt_ms)
+            .fold(f64::INFINITY, f64::min);
+        let last = s.samples.back();
+        let last_offset_ms = last.map(|x| x.offset_ms).unwrap_or(0.0);
+        let last_rtt_ms = last.map(|x| x.rtt_ms).unwrap_or(0.0);
+        SyncStats {
+            applied_offset_ms: s.applied_offset_ms,
+            target_offset_ms: s.target_offset_ms,
+            best_rtt_ms: if best_rtt.is_finite() { best_rtt } else { 0.0 },
+            last_offset_ms,
+            last_rtt_ms,
+            samples: s.samples.len(),
+        }
     }
 
     /// Best estimate of the server's current clock (epoch ms, fractional). Each
@@ -355,7 +393,12 @@ impl Default for ClientRegistry {
 /// Client side: repeatedly exchange timestamps with the server and feed the
 /// results into `clock`, applying any volume the server sends back to `volume`.
 /// Runs forever; intended to live on its own thread.
-pub fn run_client_sync(server_ip: Ipv4Addr, sync_port: u16, clock: Arc<SyncedClock>) {
+pub fn run_client_sync(
+    server_ip: Ipv4Addr,
+    sync_port: u16,
+    clock: Arc<SyncedClock>,
+    metrics: Arc<DeviceMetrics>,
+) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(s) => s,
         Err(e) => {
@@ -389,6 +432,15 @@ pub fn run_client_sync(server_ip: Ipv4Addr, sync_port: u16, clock: Arc<SyncedClo
                     // offset = server_clock − midpoint of the client send/recv.
                     let offset = resp.server_ms as f64 - (t1 as f64 + t4 as f64) / 2.0;
                     clock.add_sample(offset, rtt);
+                    let st = clock.stats();
+                    metrics.record_sync(
+                        st.applied_offset_ms,
+                        st.target_offset_ms,
+                        st.last_offset_ms,
+                        st.last_rtt_ms,
+                        st.best_rtt_ms,
+                        st.samples as u32,
+                    );
                 }
             }
         }

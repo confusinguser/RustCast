@@ -119,9 +119,10 @@ impl NetworkSource {
         let server_ip = *shared.server_ip.lock().unwrap();
         let sync = server_ip.map(|ip| {
             let clock = clock.clone();
+            let metrics = metrics.clone();
             thread::Builder::new()
                 .name("time-sync".into())
-                .spawn(move || run_client_sync(ip, DEFAULT_SYNC_PORT, clock))
+                .spawn(move || run_client_sync(ip, DEFAULT_SYNC_PORT, clock, metrics))
                 .expect("spawn time-sync thread")
         });
         // Volume + delay arrive on their own channel, separate from time-sync.

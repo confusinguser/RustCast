@@ -167,6 +167,19 @@ pub struct TelemetryReport {
     pub output_queue_len: u32,
     /// Jitter-buffer depth in packets.
     pub jitter_buffer_len: u32,
+    // --- clock sync ---
+    /// Applied clock offset (server_clock - client_clock), ms; what playback uses.
+    pub clock_offset_ms: f64,
+    /// Best clock-offset estimate, ms (lowest-RTT sample in the window).
+    pub clock_target_offset_ms: f64,
+    /// Raw offset from the most recent NTP exchange, ms (before lowest-RTT pick).
+    pub last_offset_ms: f64,
+    /// RTT of the most recent NTP exchange, ms.
+    pub last_rtt_ms: f64,
+    /// Best round-trip time in the sync window, ms.
+    pub rtt_ms: f64,
+    /// Number of sync samples currently held.
+    pub sync_samples: u32,
 }
 
 /// Current local wall-clock time as UNIX-epoch milliseconds. On the client this

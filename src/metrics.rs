@@ -42,6 +42,13 @@ pub struct DeviceMetrics {
     jitter_buffer_len: AtomicU32,
     sample_rate: AtomicU32,
     channels: AtomicU32,
+    // Clock-sync state (f64 stored as bits since there is no AtomicF64).
+    clock_offset_bits: AtomicU64,
+    clock_target_bits: AtomicU64,
+    last_offset_bits: AtomicU64,
+    last_rtt_bits: AtomicU64,
+    rtt_bits: AtomicU64,
+    sync_samples: AtomicU32,
 }
 
 impl DeviceMetrics {
@@ -92,6 +99,24 @@ impl DeviceMetrics {
         self.jitter_buffer_len.store(n as u32, Ordering::Relaxed);
     }
 
+    /// Record the latest clock-sync state (offsets/RTT in ms, sample count).
+    pub fn record_sync(
+        &self,
+        applied_ms: f64,
+        target_ms: f64,
+        last_offset_ms: f64,
+        last_rtt_ms: f64,
+        rtt_ms: f64,
+        samples: u32,
+    ) {
+        self.clock_offset_bits.store(applied_ms.to_bits(), Ordering::Relaxed);
+        self.clock_target_bits.store(target_ms.to_bits(), Ordering::Relaxed);
+        self.last_offset_bits.store(last_offset_ms.to_bits(), Ordering::Relaxed);
+        self.last_rtt_bits.store(last_rtt_ms.to_bits(), Ordering::Relaxed);
+        self.rtt_bits.store(rtt_ms.to_bits(), Ordering::Relaxed);
+        self.sync_samples.store(samples, Ordering::Relaxed);
+    }
+
     /// A wire snapshot of all current values, stamped with the local clock.
     pub fn snapshot(&self) -> TelemetryReport {
         TelemetryReport {
@@ -107,6 +132,12 @@ impl DeviceMetrics {
             underruns: self.underruns.load(Ordering::Relaxed),
             output_queue_len: self.output_queue_len.load(Ordering::Relaxed),
             jitter_buffer_len: self.jitter_buffer_len.load(Ordering::Relaxed),
+            clock_offset_ms: f64::from_bits(self.clock_offset_bits.load(Ordering::Relaxed)),
+            clock_target_offset_ms: f64::from_bits(self.clock_target_bits.load(Ordering::Relaxed)),
+            last_offset_ms: f64::from_bits(self.last_offset_bits.load(Ordering::Relaxed)),
+            last_rtt_ms: f64::from_bits(self.last_rtt_bits.load(Ordering::Relaxed)),
+            rtt_ms: f64::from_bits(self.rtt_bits.load(Ordering::Relaxed)),
+            sync_samples: self.sync_samples.load(Ordering::Relaxed),
         }
     }
 }
@@ -221,6 +252,12 @@ pub struct ClientSample {
     pub underruns: u64,
     pub output_queue_len: u32,
     pub jitter_buffer_len: u32,
+    pub clock_offset_ms: f64,
+    pub clock_target_offset_ms: f64,
+    pub last_offset_ms: f64,
+    pub last_rtt_ms: f64,
+    pub rtt_ms: f64,
+    pub sync_samples: u32,
 }
 
 /// One timestamped server send-path sample.
@@ -300,6 +337,12 @@ impl TelemetryStore {
             underruns: report.underruns,
             output_queue_len: report.output_queue_len,
             jitter_buffer_len: report.jitter_buffer_len,
+            clock_offset_ms: report.clock_offset_ms,
+            clock_target_offset_ms: report.clock_target_offset_ms,
+            last_offset_ms: report.last_offset_ms,
+            last_rtt_ms: report.last_rtt_ms,
+            rtt_ms: report.rtt_ms,
+            sync_samples: report.sync_samples,
         });
         while hist.samples.len() > HISTORY_LEN {
             hist.samples.pop_front();
