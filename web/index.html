@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>RustCast</title>
   <!-- React + Babel from CDN: needs internet the first time. Served same-origin
-       as the API, so fetch() calls need no CORS. -->
+       as the API, so fetch() calls need no CORS. The live graphs are drawn on a
+       plain <canvas> with no charting library, so nothing else is fetched. -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -17,7 +18,7 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #0f1115; color: #e6e8ec;
     }
-    .wrap { max-width: 680px; margin: 0 auto; padding: 32px 20px 64px; }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
     header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 24px; }
     h1 { font-size: 24px; margin: 0; letter-spacing: -0.02em; }
     .sub { color: #8b909a; font-size: 13px; }
@@ -25,11 +26,13 @@
       background: #171a21; border: 1px solid #262b36; border-radius: 12px;
       padding: 16px 18px; margin-bottom: 12px;
     }
+    .card.server { border-color: #2f3a2f; }
     .row { display: flex; align-items: center; gap: 12px; }
     .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
     .dot.on { background: #35d07f; box-shadow: 0 0 8px #35d07f88; }
     .dot.off { background: #545a66; }
     .ip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px; }
+    .title { font-size: 15px; font-weight: 600; }
     .meta { color: #8b909a; font-size: 12px; margin-left: auto; }
     .slider-row { display: flex; align-items: center; gap: 14px; margin-top: 14px; }
     .label { width: 38px; font-size: 12px; color: #8b909a; flex: none; }
@@ -37,6 +40,21 @@
     .pct { width: 44px; text-align: right; font-variant-numeric: tabular-nums; font-size: 14px; color: #c7ccd6; }
     .empty { color: #8b909a; text-align: center; padding: 48px 0; }
     .err { color: #ff6b6b; font-size: 13px; margin-bottom: 16px; }
+
+    /* Telemetry readouts + graphs */
+    .stats { margin-top: 16px; border-top: 1px solid #262b36; padding-top: 14px; }
+    .readouts { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-bottom: 12px; }
+    .stat { display: flex; flex-direction: column; gap: 2px; }
+    .stat .k { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: #7d838f; }
+    .stat .v { font-size: 15px; font-variant-numeric: tabular-nums; color: #e6e8ec; }
+    .stat .v.warn { color: #ffb020; }
+    .stat .v.bad { color: #ff6b6b; }
+    .graph { margin-top: 10px; }
+    .graph .gtitle { font-size: 11px; color: #8b909a; margin-bottom: 4px; display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; }
+    .legend { display: inline-flex; align-items: center; gap: 5px; }
+    .swatch { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+    canvas { width: 100%; display: block; border-radius: 6px; background: #10131a; }
+    .nodata { color: #7d838f; font-size: 12px; padding: 10px 0; }
   </style>
 </head>
 <body>
@@ -44,24 +62,257 @@
   <script type="text/babel">
     const { useState, useEffect, useRef, useCallback } = React;
 
-    // PUT a client setting, debounced per (ip, field) so dragging a slider
-    // doesn't flood the server.
-    function useDebouncedPut() {
-      const timers = useRef({});
-      return useCallback((ip, field, body) => {
-        const key = ip + ":" + field;
-        clearTimeout(timers.current[key]);
-        timers.current[key] = setTimeout(() => {
-          fetch(`/api/clients/${ip}/${field}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          }).catch(() => {});
-        }, 120);
-      }, []);
+    // Rolling window shown on every graph, in milliseconds, and poll cadence.
+    const WINDOW_MS = 60000;
+    const POLL_MS = 100;
+
+    // Colors, kept consistent across graphs and legends.
+    const C = {
+      jitter: "#4c8bf5",   // network jitter buffer
+      output: "#35d07f",   // rodio/cpal output queue
+      rate: "#b98bf5",     // sample throughput
+      pending: "#3fb9b0",  // server pending backlog
+      send: "#e0c14c",     // server send rate
+      drop: "#ff6b6b",     // overrun/late/lost events
+      under: "#ffb020",    // underrun / re-anchor events
+      grid: "#20242e",
+      axis: "#5b616d",
+    };
+
+    // ---- pure helpers -------------------------------------------------------
+
+    // Per-second rate of a cumulative counter, sample-to-sample.
+    function rateSeries(samples, key) {
+      const out = [];
+      for (let i = 1; i < samples.length; i++) {
+        const dt = (samples[i].t - samples[i - 1].t) / 1000;
+        if (dt <= 0) continue;
+        out.push({ x: samples[i].t, y: Math.max(0, (samples[i][key] - samples[i - 1][key]) / dt) });
+      }
+      return out;
     }
 
-    function Client({ c, volume, delay, onVolume, onDelay }) {
+    // A plain gauge series {x,y} for a numeric key.
+    function gaugeSeries(samples, key) {
+      return samples.map((s) => ({ x: s.t, y: s[key] }));
+    }
+
+    // Vertical event markers where the summed counters increased between samples.
+    function eventMarkers(samples, keys, color) {
+      const out = [];
+      for (let i = 1; i < samples.length; i++) {
+        let d = 0;
+        for (const k of keys) d += samples[i][k] - samples[i - 1][k];
+        if (d > 0) out.push({ x: samples[i].t, color });
+      }
+      return out;
+    }
+
+    // ---- canvas graph -------------------------------------------------------
+
+    // Draws one or more {name,color,points:[{x,y}]} series plus optional vertical
+    // markers over a rolling [now-WINDOW_MS, now] window. Redraws on every
+    // animation frame with a live right edge, so it scrolls smoothly and keeps
+    // moving even when no new data arrives from the backend.
+    function Graph({ title, series, markers = [], clockOffset = 0, height = 96, unit = "" }) {
+      const ref = useRef(null);
+      // Latest inputs, read fresh by the animation loop each frame.
+      const data = useRef({ series, markers, clockOffset, height });
+      data.current = { series, markers, clockOffset, height };
+
+      useEffect(() => {
+        let raf = 0;
+        const draw = () => {
+        const cv = ref.current;
+        if (!cv) { raf = requestAnimationFrame(draw); return; }
+        const { series, markers, clockOffset, height: h } = data.current;
+        const dpr = window.devicePixelRatio || 1;
+        const w = cv.clientWidth || 600;
+        cv.width = w * dpr;
+        cv.height = h * dpr;
+        const ctx = cv.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+
+        const padL = 40, padR = 8, padT = 8, padB = 16;
+        // Live right edge = current server time; advances every frame so the
+        // window scrolls left continuously, data or not.
+        const x1 = Date.now() + clockOffset, x0 = x1 - WINDOW_MS;
+        let yMax = 0;
+        for (const s of series) for (const p of s.points) if (p.x >= x0 && p.y > yMax) yMax = p.y;
+        yMax = yMax <= 0 ? 1 : yMax * 1.15;
+
+        const sx = (x) => padL + ((x - x0) / (x1 - x0)) * (w - padL - padR);
+        const sy = (y) => (h - padB) - (y / yMax) * (h - padT - padB);
+
+        // grid + y labels (0, mid, max)
+        ctx.font = "10px ui-monospace, monospace";
+        ctx.textBaseline = "middle";
+        ctx.lineWidth = 1;
+        for (const frac of [0, 0.5, 1]) {
+          const val = yMax * frac;
+          const y = sy(val);
+          ctx.strokeStyle = C.grid;
+          ctx.beginPath();
+          ctx.moveTo(padL, y);
+          ctx.lineTo(w - padR, y);
+          ctx.stroke();
+          const lbl = val >= 100 ? Math.round(val) : val >= 10 ? val.toFixed(0) : val.toFixed(1);
+          ctx.fillStyle = C.axis;
+          ctx.textAlign = "right";
+          ctx.fillText(lbl, padL - 4, y);
+        }
+        // x axis ticks
+        ctx.fillStyle = C.axis;
+        ctx.textAlign = "center";
+        for (const secs of [60, 30, 0]) {
+          ctx.fillText(secs === 0 ? "now" : `-${secs}s`, sx(x1 - secs * 1000), h - padB + 8);
+        }
+
+        // markers (behind lines)
+        for (const m of markers) {
+          const x = sx(m.x);
+          if (x < padL || x > w - padR) continue;
+          ctx.strokeStyle = m.color;
+          ctx.globalAlpha = 0.5;
+          ctx.beginPath();
+          ctx.moveTo(x, padT);
+          ctx.lineTo(x, h - padB);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+
+        // lines
+        for (const s of series) {
+          if (!s.points.length) continue;
+          ctx.strokeStyle = s.color;
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          let started = false, last = null;
+          for (const p of s.points) {
+            if (p.x < x0) continue;
+            const X = sx(p.x), Y = sy(p.y);
+            if (!started) { ctx.moveTo(X, Y); started = true; } else ctx.lineTo(X, Y);
+            last = p;
+          }
+          ctx.stroke();
+          if (last) {
+            ctx.fillStyle = s.color;
+            ctx.beginPath();
+            ctx.arc(sx(last.x), sy(last.y), 2.4, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+          raf = requestAnimationFrame(draw);
+        };
+        raf = requestAnimationFrame(draw);
+        return () => cancelAnimationFrame(raf);
+      }, []);
+
+      return (
+        <div className="graph">
+          <div className="gtitle">
+            <span>{title}{unit ? ` (${unit})` : ""}</span>
+            {series.map((s) => (
+              <span className="legend" key={s.name}>
+                <span className="swatch" style={{ background: s.color }}></span>
+                {s.name}
+              </span>
+            ))}
+          </div>
+          <canvas ref={ref} style={{ height }} />
+        </div>
+      );
+    }
+
+    // ---- server card --------------------------------------------------------
+
+    function ServerCard({ stats, clockOffset }) {
+      if (!stats) return null;
+      const s = stats.server || [];
+      const latest = s[s.length - 1];
+      const sendRate = rateSeries(s, "packets_sent");
+      const lastRate = sendRate.length ? sendRate[sendRate.length - 1].y : 0;
+      const reanchors = latest ? latest.reanchors : 0;
+      return (
+        <div className="card server">
+          <div className="row">
+            <span className="dot on"></span>
+            <span className="title">Server source</span>
+            <span className="meta">
+              {stats.sample_rate ? `${stats.sample_rate} Hz · ${stats.channels}ch · ${stats.lead_ms}ms lead` : ""}
+            </span>
+          </div>
+          <div className="stats">
+            <div className="readouts">
+              <div className="stat"><span className="k">Send rate</span><span className="v">{lastRate.toFixed(0)} pkt/s</span></div>
+              <div className="stat"><span className="k">Packets sent</span><span className="v">{latest ? latest.packets_sent.toLocaleString() : "—"}</span></div>
+              <div className="stat"><span className="k">Pending backlog</span><span className="v">{latest ? latest.pending_len : "—"} smp</span></div>
+              <div className="stat"><span className="k">Re-anchors</span><span className={"v " + (reanchors > 0 ? "warn" : "")}>{reanchors}</span></div>
+            </div>
+            <Graph
+              title="Send rate" unit="pkt/s" clockOffset={clockOffset}
+              series={[{ name: "sent", color: C.send, points: sendRate }]}
+            />
+            <Graph
+              title="Pending backlog" unit="samples awaiting packetization" clockOffset={clockOffset}
+              series={[{ name: "pending", color: C.pending, points: gaugeSeries(s, "pending_len") }]}
+              markers={eventMarkers(s, ["reanchors"], C.under)}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // ---- device telemetry (inside each client card) ------------------------
+
+    function DeviceStats({ st, clockOffset }) {
+      if (!st || !(st.samples || []).length) {
+        return <div className="stats"><div className="nodata">no telemetry yet from this device</div></div>;
+      }
+      const samples = st.samples;
+      const latest = samples[samples.length - 1];
+      const rate = rateSeries(samples, "samples_appended");
+      const lastRate = rate.length ? rate[rate.length - 1].y : 0;
+
+      const dropMarkers = eventMarkers(samples, ["overrun_drops", "late_drops", "lost_packets"], C.drop);
+      const underMarkers = eventMarkers(samples, ["underruns"], C.under);
+
+      return (
+        <div className="stats">
+          <div className="readouts">
+            <div className="stat"><span className="k">Jitter buffer</span><span className="v">{latest.jitter_buffer_len} pkt</span></div>
+            <div className="stat"><span className="k">Output queue</span><span className={"v " + (latest.output_queue_len === 0 ? "warn" : "")}>{latest.output_queue_len} buf</span></div>
+            <div className="stat"><span className="k">Samples/s</span><span className="v">{lastRate.toFixed(0)}</span></div>
+            <div className="stat"><span className="k">Underruns</span><span className={"v " + (latest.underruns > 0 ? "warn" : "")}>{latest.underruns}</span></div>
+            <div className="stat"><span className="k">Overrun</span><span className={"v " + (latest.overrun_drops > 0 ? "bad" : "")}>{latest.overrun_drops}</span></div>
+            <div className="stat"><span className="k">Late</span><span className={"v " + (latest.late_drops > 0 ? "bad" : "")}>{latest.late_drops}</span></div>
+            <div className="stat"><span className="k">Lost</span><span className={"v " + (latest.lost_packets > 0 ? "bad" : "")}>{latest.lost_packets}</span></div>
+          </div>
+          <Graph
+            title="Buffer depth" unit="jitter pkt · output buf" clockOffset={clockOffset} height={110}
+            series={[
+              { name: "jitter buffer", color: C.jitter, points: gaugeSeries(samples, "jitter_buffer_len") },
+              { name: "output queue", color: C.output, points: gaugeSeries(samples, "output_queue_len") },
+            ]}
+            markers={[...dropMarkers, ...underMarkers]}
+          />
+          <Graph
+            title="Samples handed to player" unit="samples/s" clockOffset={clockOffset}
+            series={[{ name: "rate", color: C.rate, points: rate }]}
+            markers={[...dropMarkers, ...underMarkers]}
+          />
+          <div className="gtitle" style={{ marginTop: 6 }}>
+            <span className="legend"><span className="swatch" style={{ background: C.drop }}></span>drop (overrun/late/lost)</span>
+            <span className="legend"><span className="swatch" style={{ background: C.under }}></span>underrun</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ---- client card (controls + telemetry) --------------------------------
+
+    function Client({ c, st, clockOffset, volume, delay, onVolume, onDelay }) {
       return (
         <div className="card">
           <div className="row">
@@ -87,30 +338,60 @@
             />
             <span className="pct">{delay}ms</span>
           </div>
+          <DeviceStats st={st} clockOffset={clockOffset} />
         </div>
       );
     }
 
+    // PUT a client setting, debounced per (ip, field) so dragging a slider
+    // doesn't flood the server.
+    function useDebouncedPut() {
+      const timers = useRef({});
+      return useCallback((ip, field, body) => {
+        const key = ip + ":" + field;
+        clearTimeout(timers.current[key]);
+        timers.current[key] = setTimeout(() => {
+          fetch(`/api/clients/${ip}/${field}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }).catch(() => {});
+        }, 120);
+      }, []);
+    }
+
     function App() {
       const [clients, setClients] = useState([]);
+      const [stats, setStats] = useState(null);
+      const [clockOffset, setClockOffset] = useState(0);
       const [volumes, setVolumes] = useState({}); // ip -> 0..1, UI source of truth
       const [delays, setDelays] = useState({});   // ip -> ms, UI source of truth
       const [error, setError] = useState(null);
       const putSetting = useDebouncedPut();
 
-      // Poll the client list once a second.
+      // Poll the client list and live telemetry together, once per second. The
+      // server keeps the full ~60s of 10Hz history, so a 1s poll still yields
+      // smooth graphs.
       useEffect(() => {
         let alive = true;
         const tick = async () => {
           try {
-            const res = await fetch("/api/clients");
-            if (!res.ok) throw new Error("HTTP " + res.status);
-            const list = await res.json();
+            const [cRes, sRes] = await Promise.all([
+              fetch("/api/clients"),
+              fetch("/api/stats"),
+            ]);
+            if (!cRes.ok) throw new Error("HTTP " + cRes.status);
+            const list = await cRes.json();
+            const st = sRes.ok ? await sRes.json() : null;
             if (!alive) return;
             setClients(list);
+            if (st) {
+              setStats(st);
+              // Align our clock to the server's so sample timestamps land on the
+              // live right edge; graphs then advance on Date.now() between polls.
+              setClockOffset(st.now_ms - Date.now());
+            }
             setError(null);
-            // Seed values for clients we haven't seen yet; keep local value for
-            // ones already on screen so the slider doesn't jump while adjusting.
             setVolumes((prev) => {
               const next = { ...prev };
               for (const c of list) if (!(c.ip in next)) next[c.ip] = c.volume;
@@ -126,7 +407,7 @@
           }
         };
         tick();
-        const id = setInterval(tick, 1000);
+        const id = setInterval(tick, POLL_MS);
         return () => { alive = false; clearInterval(id); };
       }, []);
 
@@ -134,25 +415,29 @@
         setVolumes((prev) => ({ ...prev, [ip]: v }));
         putSetting(ip, "volume", { volume: v });
       };
-
       const onDelay = (ip, ms) => {
         setDelays((prev) => ({ ...prev, [ip]: ms }));
         putSetting(ip, "delay", { delay_ms: ms });
       };
 
+      // Index telemetry by IP so each card can find its own history.
+      const statsByIp = {};
+      if (stats) for (const cs of stats.clients) statsByIp[cs.ip] = cs;
+
       return (
         <div className="wrap">
           <header>
             <h1>RustCast</h1>
-            <span className="sub">{clients.length} client{clients.length === 1 ? "" : "s"}</span>
+            <span className="sub">{clients.length} client{clients.length === 1 ? "" : "s"} · live telemetry</span>
           </header>
           {error && <div className="err">{error}</div>}
+          <ServerCard stats={stats} clockOffset={clockOffset} />
           {clients.length === 0 && !error && (
             <div className="empty">No clients connected yet.</div>
           )}
           {clients.map((c) => (
             <Client
-              key={c.ip} c={c}
+              key={c.ip} c={c} st={statsByIp[c.ip]} clockOffset={clockOffset}
               volume={volumes[c.ip] ?? c.volume}
               delay={delays[c.ip] ?? c.delay_ms}
               onVolume={onVolume} onDelay={onDelay}

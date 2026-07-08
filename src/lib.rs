@@ -6,7 +6,7 @@
 //!   the per-packet play-at timestamp so multiple clients stay in sync.
 
 pub mod api;
-pub mod player;
+pub mod metrics;
 pub mod source;
 pub mod sync;
 pub mod wire;

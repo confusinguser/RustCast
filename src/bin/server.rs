@@ -12,23 +12,28 @@ use rustcast::source::librespot::LibrespotSource;
 use rustcast::source::pipe::PipeSource;
 use rustcast::source::{AudioSource, Format};
 use std::sync::Arc;
+use std::time::Duration;
 use rustcast::api;
+use rustcast::metrics::{ServerMetrics, TelemetryStore, run_telemetry_receiver};
 use rustcast::sync::{ClientRegistry, run_server_responder};
 use rustcast::wire::{
-    AudioPacket, DEFAULT_GROUP, DEFAULT_PORT, DEFAULT_SYNC_PORT, TARGET_PCM_BYTES, WireFormat,
-    now_epoch_ms,
+    AudioPacket, DEFAULT_GROUP, DEFAULT_PORT, DEFAULT_SYNC_PORT, DEFAULT_TELEMETRY_PORT,
+    TARGET_PCM_BYTES, WireFormat, now_epoch_ms,
 };
 
 /// Port for the HTTP control API + web UI.
 const HTTP_PORT: u16 = 8080;
 
-// Pipe kernel-buffer size (see PipeSource): ~46ms at 44.1 kHz stereo s16le.
-const PIPE_BYTES: i32 = 8 * 1024;
 // How far ahead of playback we timestamp packets. This is the client's jitter
 // buffer depth: bigger = more resilient to network jitter, more latency.
 const SEND_LEAD_MS: u64 = 200;
 // Multicast TTL. 1 keeps traffic on the local subnet; raise to route further.
 const MULTICAST_TTL: u32 = 1;
+// How often the server samples its own send-path metrics into the telemetry
+// history, matching the clients' ~10 Hz report rate.
+const SERVER_SAMPLE_MS: u64 = 100;
+
+const REANCHOR_TOLERANCE_MS: u64 = 60;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -50,13 +55,34 @@ fn main() {
     // read/written by the HTTP API. Start both before opening the source so the
     // control UI is reachable immediately.
     let registry = Arc::new(ClientRegistry::new());
+    // Server send-path metrics and the per-source telemetry history the UI graphs.
+    let server_metrics = Arc::new(ServerMetrics::new());
+    let telemetry = Arc::new(TelemetryStore::new());
     {
         let reg = registry.clone();
-        std::thread::spawn(move || api::run(reg, HTTP_PORT));
+        let store = telemetry.clone();
+        let meta = server_metrics.clone();
+        std::thread::spawn(move || api::run(reg, store, meta, HTTP_PORT));
     }
     {
         let reg = registry.clone();
         std::thread::spawn(move || run_server_responder(DEFAULT_SYNC_PORT, reg));
+    }
+    // Receive client telemetry reports into the store.
+    {
+        let store = telemetry.clone();
+        std::thread::spawn(move || run_telemetry_receiver(DEFAULT_TELEMETRY_PORT, store));
+    }
+    // Sample the server's own send-path metrics into the history at ~10 Hz.
+    {
+        let store = telemetry.clone();
+        let meta = server_metrics.clone();
+        std::thread::spawn(move || {
+            loop {
+                store.push_server(meta.snapshot());
+                std::thread::sleep(Duration::from_millis(SERVER_SAMPLE_MS));
+            }
+        });
     }
 
     let mut source: Box<dyn AudioSource> = match source_kind.as_str() {
@@ -65,7 +91,7 @@ fn main() {
                 channels: 2,
                 sample_rate: 44_100,
             };
-            Box::new(PipeSource::open("testfifo", format, PIPE_BYTES).expect("open FIFO"))
+            Box::new(PipeSource::open("testfifo", format).expect("open FIFO"))
         }
         "spotify" => {
             Box::new(LibrespotSource::new("RustCast".into()).expect("start Spotify receiver"))
@@ -79,6 +105,7 @@ fn main() {
     let fmt = source.format();
     let channels = fmt.channels as usize;
     let sample_rate = fmt.sample_rate as u64;
+    server_metrics.set_static(fmt.sample_rate, fmt.channels, SEND_LEAD_MS as u32);
 
     // Socket for sending. Bind to an ephemeral port; set the multicast TTL.
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind send socket");
@@ -113,17 +140,27 @@ fn main() {
     let mut pending: Vec<f32> = Vec::with_capacity(samples_per_packet * 2);
 
     loop {
-        match source.next_samples() {
+        // If we have pending samples, try to read more with a short timeout.
+        // If we don't get any, we flush the ones we already have.
+        let have_pending_samples = pending.len() > 0;
+        let samples = if have_pending_samples {
+            source.next_samples_timeout(Duration::from_millis(20))
+        } else {
+            source.next_samples()
+        };
+
+        match samples {
             Ok(Some(samples)) => pending.extend_from_slice(&samples),
-            Ok(None) => continue, // source ended
+            Ok(None) if !have_pending_samples => break, // source ended
+            Ok(None) => {}, // flush pending samples, None because of timeout
             Err(e) => {
                 eprintln!("source error: {e}");
                 break;
             }
         }
 
-        while pending.len() >= samples_per_packet {
-            let chunk: Vec<f32> = pending.drain(..samples_per_packet).collect();
+        while pending.len() > 0 {
+            let chunk: Vec<f32> = pending.drain(..samples_per_packet.min(pending.len())).collect();
 
             // When this chunk's audio should start playing, and when we should
             // actually put it on the wire (SEND_LEAD_MS earlier). Pace sending
@@ -134,13 +171,14 @@ fn main() {
             // Re-anchor if the timeline has fallen behind real time (source
             // started late or paused). Without this, play_at would be in the
             // past and clients would drop every packet as "too late".
-            if start_ms + offset_ms < now {
+            if start_ms + offset_ms + REANCHOR_TOLERANCE_MS < now {
                 start_ms = now - offset_ms;
+                server_metrics.record_reanchor();
             }
             let play_at_ms = start_ms + SEND_LEAD_MS + offset_ms;
             let send_at_ms = start_ms + offset_ms;
             if send_at_ms > now {
-                std::thread::sleep(std::time::Duration::from_millis(send_at_ms - now));
+                std::thread::sleep(Duration::from_millis(send_at_ms - now));
             }
 
             let pkt = AudioPacket {
@@ -159,6 +197,12 @@ fn main() {
 
             seq += 1;
             total_frames += frames_per_packet as u64;
+            server_metrics.record_packet_sent(frames_per_packet as u64);
+            server_metrics.set_pending_len(pending.len());
+
+            if pending.len() < samples_per_packet {
+                break; // try to read more samples before sending the next packet
+            }
         }
     }
 

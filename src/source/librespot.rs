@@ -67,6 +67,12 @@ impl AudioSource for LibrespotSource {
         // means the receiver thread ended -> end of stream.
         Ok(self.rx.recv().ok())
     }
+    
+    fn next_samples_timeout(&mut self, duration: Duration) -> io::Result<Option<Vec<f32>>> {
+        // Blocks until the sink delivers the next block; `Err` (channel closed)
+        // means the receiver thread ended -> end of stream.
+        Ok(self.rx.recv_timeout(duration).ok())
+    }
 }
 
 /// Advertise over Zeroconf and, for each set of credentials a controller hands

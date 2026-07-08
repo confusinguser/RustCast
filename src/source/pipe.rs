@@ -1,15 +1,13 @@
 use std::fs::File;
 use std::io::{self, BufReader, Read};
-use std::os::fd::AsRawFd;
 use std::path::Path;
-
+use std::time::Duration;
 use super::{AudioSource, Format};
 
 const BYTES_PER_SAMPLE: usize = 2; // i16
 
 /// Reads interleaved signed-16-bit little-endian PCM from a FIFO and yields it
-/// as `f32` samples. On open it shrinks the pipe's kernel buffer so little
-/// already-produced audio stays parked in the pipe when the writer pauses.
+/// as `f32` samples.
 pub struct PipeSource {
     reader: BufReader<File>,
     format: Format,
@@ -20,24 +18,9 @@ pub struct PipeSource {
 }
 
 impl PipeSource {
-    /// Open a FIFO carrying s16le PCM at `format`, shrinking its kernel buffer
-    /// to (about) `pipe_bytes`. The kernel rounds the size up to at least one
-    /// page; a failure to resize is logged but not fatal.
-    pub fn open(path: impl AsRef<Path>, format: Format, pipe_bytes: i32) -> io::Result<Self> {
+    /// Open a FIFO carrying s16le PCM at `format`.
+    pub fn open(path: impl AsRef<Path>, format: Format) -> io::Result<Self> {
         let file = File::open(path)?;
-
-        // F_SETPIPE_SZ is Linux-only; returns the actual size or -1.
-        let fd = file.as_raw_fd();
-        let set = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, pipe_bytes) };
-        if set < 0 {
-            eprintln!(
-                "warning: could not shrink pipe buffer: {}",
-                io::Error::last_os_error()
-            );
-        } else {
-            println!("pipe buffer size: {set} bytes");
-        }
-
         Ok(Self {
             reader: BufReader::new(file),
             format,
@@ -72,5 +55,12 @@ impl AudioSource for PipeSource {
         self.leftover.drain(..complete);
 
         Ok(Some(samples))
+    }
+
+    fn next_samples_timeout(
+        &mut self,
+        _duration: Duration,
+    ) -> io::Result<Option<Vec<f32>>> {
+        self.next_samples()
     }
 }

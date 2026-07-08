@@ -13,6 +13,8 @@ pub const DEFAULT_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
 pub const DEFAULT_PORT: u16 = 5004;
 /// Unicast port on the server that answers time-sync requests.
 pub const DEFAULT_SYNC_PORT: u16 = 5005;
+/// Unicast port on the server that receives client telemetry reports.
+pub const DEFAULT_TELEMETRY_PORT: u16 = 5006;
 
 /// Target PCM payload per datagram. Kept well under a 1500-byte MTU (with room
 /// for the bincode header + IP/UDP headers) to avoid IP fragmentation.
@@ -117,6 +119,40 @@ pub struct TimeResponse {
     /// packet this much *earlier* than its `play_at`, to compensate for the
     /// latency between this computer and its speaker.
     pub delay_ms: u32,
+}
+
+/// A telemetry snapshot pushed by a client to the server (unicast, ~10 Hz) so
+/// the web UI can graph each device's buffers and sample flow live. Counters are
+/// cumulative since the client started; gauges are the instantaneous value at
+/// report time. Kept small and flat so it fits comfortably in one datagram.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TelemetryReport {
+    /// Client's local clock (epoch ms) at report time.
+    pub sent_ms: u64,
+    /// Stream format, so the UI can convert buffer depths to milliseconds.
+    pub sample_rate: u32,
+    pub channels: u16,
+    // --- counters (cumulative) ---
+    /// Sample blocks handed to the player (`player.append`).
+    pub blocks_appended: u64,
+    /// Individual interleaved samples handed to the player.
+    pub samples_appended: u64,
+    /// Packets received from the multicast stream.
+    pub packets_received: u64,
+    /// Blocks dropped because the output queue was already too deep (overrun).
+    pub overrun_drops: u64,
+    /// Packets dropped for arriving past their play-at time (late).
+    pub late_drops: u64,
+    /// Packets skipped as lost (never arrived within the jitter window).
+    pub lost_packets: u64,
+    /// Times the output queue was observed empty while streaming - a proxy for
+    /// device underrun (rodio/cpal does not expose true callback underflows).
+    pub underruns: u64,
+    // --- gauges (instantaneous at report time) ---
+    /// Output (device) queue depth in buffers, i.e. `player.len()`.
+    pub output_queue_len: u32,
+    /// Jitter-buffer depth in packets.
+    pub jitter_buffer_len: u32,
 }
 
 /// Current local wall-clock time as UNIX-epoch milliseconds. On the client this

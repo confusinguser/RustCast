@@ -11,6 +11,7 @@ use poem::web::{Data, Html, Json, Path};
 use poem::{EndpointExt, Route, Server, get, handler, put};
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::{ServerMetrics, StatsSnapshot, TelemetryStore};
 use crate::sync::ClientRegistry;
 
 /// The single-page UI, compiled into the binary.
@@ -57,6 +58,18 @@ fn list_clients(Data(reg): Data<&Arc<ClientRegistry>>) -> Json<Vec<ClientDto>> {
     Json(clients)
 }
 
+/// Live telemetry for the graphs: the server send-path history plus each
+/// device's recent buffer/sample history. Polled ~1 Hz; each response carries
+/// the full ~60 s window (the client reports at 10 Hz, so the graphs stay smooth
+/// even though the poll is slow).
+#[handler]
+fn stats(
+    Data(store): Data<&Arc<TelemetryStore>>,
+    Data(meta): Data<&Arc<ServerMetrics>>,
+) -> Json<StatsSnapshot> {
+    Json(store.snapshot(meta))
+}
+
 #[handler]
 fn set_volume(
     Path(ip): Path<String>,
@@ -90,15 +103,23 @@ fn set_delay(
 }
 
 /// Run the HTTP server on its own tokio runtime. Blocks; intended for a thread.
-pub fn run(registry: Arc<ClientRegistry>, port: u16) {
+pub fn run(
+    registry: Arc<ClientRegistry>,
+    telemetry: Arc<TelemetryStore>,
+    server_metrics: Arc<ServerMetrics>,
+    port: u16,
+) {
     let rt = tokio::runtime::Runtime::new().expect("build api runtime");
     rt.block_on(async move {
         let app = Route::new()
             .at("/", get(index))
             .at("/api/clients", get(list_clients))
+            .at("/api/stats", get(stats))
             .at("/api/clients/:ip/volume", put(set_volume))
             .at("/api/clients/:ip/delay", put(set_delay))
-            .data(registry);
+            .data(registry)
+            .data(telemetry)
+            .data(server_metrics);
 
         println!("HTTP API + UI on http://0.0.0.0:{port}");
         if let Err(e) = Server::new(TcpListener::bind(format!("0.0.0.0:{port}")))

@@ -1,13 +1,28 @@
 //! RustCast client: join the multicast group and play the stream, aligned to
 //! each packet's play-at timestamp so all clients stay in sync.
 //!
-//! Usage: `client` (uses the default group/port from the wire protocol).
+//! Usage: `client [interface-ip]`
 
 use std::net::{Ipv4Addr, UdpSocket};
+use std::num::NonZero;
+use std::sync::Arc;
+use std::thread;
 
-use rustcast::player;
+use rodio::SampleRate;
+use rodio::cpal::BufferSize;
+use rustcast::metrics::{DeviceMetrics, run_telemetry_sender};
 use rustcast::source::network::NetworkSource;
-use rustcast::wire::{DEFAULT_GROUP, DEFAULT_PORT};
+use rustcast::wire::{DEFAULT_GROUP, DEFAULT_PORT, DEFAULT_TELEMETRY_PORT};
+
+/// How often each client reports its live buffer/sample telemetry to the server.
+const TELEMETRY_INTERVAL_MS: u64 = 100; // ~10 Hz
+
+// Small cpal device buffer to keep output-side latency low.
+const DEVICE_BUFFER_FRAMES: u32 = 512; // ~11ms at 44.1 kHz
+// If rodio's output queue grows past this, the sound card is draining slower
+// than the stream arrives (clock/card drift); drop a block to keep latency
+// from creeping up. The network source already keeps its own buffer near-empty.
+const MAX_QUEUED_BUFFERS: usize = 60;
 
 fn main() {
     // Optional local interface IP to receive multicast on (for multi-homed
@@ -17,8 +32,6 @@ fn main() {
         .map(|s| s.parse().expect("interface must be an IPv4 address"))
         .unwrap_or(Ipv4Addr::UNSPECIFIED);
 
-    // Bind to the multicast port on all interfaces, then join the group. On
-    // Linux this lets us receive datagrams sent to DEFAULT_GROUP:DEFAULT_PORT.
     let socket =
         UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT)).expect("bind receive socket");
     socket
@@ -27,7 +40,82 @@ fn main() {
 
     println!("Listening on {DEFAULT_GROUP}:{DEFAULT_PORT} (interface {iface}) ...");
 
-    let source = NetworkSource::new(socket).expect("start network source");
+    // Shared live metrics, written by both the network source and this playback
+    // loop and shipped to the server for the web UI's graphs.
+    let metrics = Arc::new(DeviceMetrics::new());
+
+    let mut source =
+        NetworkSource::new(socket, metrics.clone()).expect("start network source");
     println!("Stream started; playing.");
-    player::play(source);
+
+    // Report telemetry to the server (address learned from the stream) at ~10 Hz.
+    {
+        let server_ip = source.server_ip_handle();
+        let metrics = metrics.clone();
+        thread::Builder::new()
+            .name("telemetry".into())
+            .spawn(move || {
+                run_telemetry_sender(
+                    server_ip,
+                    DEFAULT_TELEMETRY_PORT,
+                    metrics,
+                    TELEMETRY_INTERVAL_MS,
+                )
+            })
+            .expect("spawn telemetry thread");
+    }
+
+    let fmt = source.format();
+    let handle = rodio::DeviceSinkBuilder::from_default_device()
+        .expect("find default output device")
+        .with_buffer_size(BufferSize::Fixed(DEVICE_BUFFER_FRAMES))
+        .open_stream()
+        .expect("open default audio stream");
+    let player = rodio::Player::connect_new(&handle.mixer());
+
+    let channels = NonZero::new(fmt.channels).expect("channels must be > 0");
+    let sample_rate = SampleRate::new(fmt.sample_rate).expect("sample_rate must be > 0");
+
+    // Tracks whether we've started feeding, so a never-yet-fed queue at length 0
+    // isn't miscounted as an underrun.
+    let mut started = false;
+    // Play the current server until it goes silent (no packets for
+    // SERVER_TIMEOUT_MS), then wait for a new server and resume.
+    loop {
+        while let Some(samples) = source.next_samples() {
+            // Apply any server-assigned volume change.
+            if let Some(vol) = source.take_volume_update() {
+                player.set_volume(vol);
+            }
+            if samples.is_empty() {
+                continue;
+            }
+
+            let queued = player.len();
+            metrics.set_output_queue_len(queued);
+            // Queue drained to empty while streaming: the card is starved
+            // (likely audible as a gap/crackle).
+            if started && queued == 0 {
+                metrics.record_underrun();
+            }
+
+            // Drop this block if the output queue is running deep (card slower
+            // than the stream) to keep latency bounded.
+            if queued > MAX_QUEUED_BUFFERS {
+                metrics.record_overrun_drop();
+                continue;
+            }
+            let n = samples.len();
+            player.append(rodio::buffer::SamplesBuffer::new(channels, sample_rate, samples));
+            metrics.record_append(n);
+            started = true;
+        }
+
+        // next_samples() returned None: nothing from the server for
+        // SERVER_TIMEOUT_MS. Stop, wait for a new server, then resume.
+        println!("Server went offline; waiting for a new server...");
+        source.wait_for_new_server();
+        println!("Stream resumed; playing.");
+        started = false;
+    }
 }
