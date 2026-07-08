@@ -7,12 +7,12 @@
 //! schedules against — no external NTP daemon required.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::wire::{TimeRequest, TimeResponse, now_epoch_ms};
+use crate::wire::{SettingsRequest, SettingsResponse, TimeRequest, TimeResponse, now_epoch_ms};
 
 /// How many recent measurements to keep when choosing the best offset.
 const SAMPLE_WINDOW: usize = 16;
@@ -27,6 +27,9 @@ const WARMUP_INTERVAL_MS: u64 = 150;
 /// Steady sync cadence. Also bounds how quickly a volume change (piggybacked on
 /// the response) reaches a client, so we keep it fairly brisk.
 const STEADY_INTERVAL_MS: u64 = 500;
+/// Fallback poll / keepalive interval. The server pushes changes instantly, so
+/// this only recovers a missed push and refreshes the client's address.
+const SETTINGS_INTERVAL_MS: u64 = 1000;
 
 #[derive(Clone, Copy)]
 struct Sample {
@@ -176,6 +179,8 @@ struct ClientEntry {
     last_seen: Instant,
     volume: f32,
     delay_ms: u32,
+    /// Address this client sends settings requests from; where we push changes.
+    settings_addr: Option<SocketAddr>,
 }
 
 /// The per-client settings returned to a client on each sync.
@@ -198,6 +203,8 @@ pub struct ClientStatus {
 /// Populated from time-sync traffic and read/written by the HTTP API.
 pub struct ClientRegistry {
     clients: Mutex<HashMap<Ipv4Addr, ClientEntry>>,
+    /// Socket used to push settings changes to clients (set by the server).
+    push_sock: Mutex<Option<Arc<UdpSocket>>>,
 }
 
 impl ClientRegistry {
@@ -213,7 +220,13 @@ impl ClientRegistry {
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
+            push_sock: Mutex::new(None),
         }
+    }
+
+    /// Provide the UDP socket used to push settings changes to clients.
+    pub fn set_push_socket(&self, sock: Arc<UdpSocket>) {
+        *self.push_sock.lock().unwrap() = Some(sock);
     }
 
     /// Mark `ip` as seen now, creating it (defaults) if new. Returns its current
@@ -224,6 +237,7 @@ impl ClientRegistry {
             last_seen: Instant::now(),
             volume: 1.0,
             delay_ms: 0,
+            settings_addr: None,
         });
         entry.last_seen = Instant::now();
         ClientSettings {
@@ -232,26 +246,80 @@ impl ClientRegistry {
         }
     }
 
-    /// Set a client's volume. No-op if the client isn't known.
-    pub fn set_volume(&self, ip: Ipv4Addr, volume: f32) -> bool {
+    /// Register/refresh a client from a settings request, recording the address
+    /// to push future changes to. Returns its current settings.
+    pub fn record_settings_addr(&self, ip: Ipv4Addr, addr: SocketAddr) -> ClientSettings {
         let mut map = self.clients.lock().unwrap();
-        if let Some(entry) = map.get_mut(&ip) {
-            entry.volume = volume.clamp(0.0, 1.0);
-            true
-        } else {
-            false
+        let entry = map.entry(ip).or_insert(ClientEntry {
+            last_seen: Instant::now(),
+            volume: 1.0,
+            delay_ms: 0,
+            settings_addr: None,
+        });
+        entry.last_seen = Instant::now();
+        entry.settings_addr = Some(addr);
+        ClientSettings {
+            volume: entry.volume,
+            delay_ms: entry.delay_ms,
         }
     }
 
-    /// Set a client's playback advance (ms earlier than play_at). No-op if the
-    /// client isn't known.
+    /// Set a client's volume and immediately push it. No-op if unknown.
+    pub fn set_volume(&self, ip: Ipv4Addr, volume: f32) -> bool {
+        let push = {
+            let mut map = self.clients.lock().unwrap();
+            match map.get_mut(&ip) {
+                Some(entry) => {
+                    entry.volume = volume.clamp(0.0, 1.0);
+                    Some(entry.settings_addr.map(|a| (a, entry.volume, entry.delay_ms)))
+                }
+                None => None,
+            }
+        };
+        match push {
+            Some(target) => {
+                if let Some((addr, vol, delay)) = target {
+                    self.push_settings(addr, vol, delay);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set a client's playback advance (ms earlier than play_at) and push it.
+    /// No-op if the client isn't known.
     pub fn set_delay(&self, ip: Ipv4Addr, delay_ms: u32) -> bool {
-        let mut map = self.clients.lock().unwrap();
-        if let Some(entry) = map.get_mut(&ip) {
-            entry.delay_ms = delay_ms.min(Self::MAX_DELAY_MS);
-            true
-        } else {
-            false
+        let push = {
+            let mut map = self.clients.lock().unwrap();
+            match map.get_mut(&ip) {
+                Some(entry) => {
+                    entry.delay_ms = delay_ms.min(Self::MAX_DELAY_MS);
+                    Some(entry.settings_addr.map(|a| (a, entry.volume, entry.delay_ms)))
+                }
+                None => None,
+            }
+        };
+        match push {
+            Some(target) => {
+                if let Some((addr, vol, delay)) = target {
+                    self.push_settings(addr, vol, delay);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Push a client's current settings to its last-known address, so a change
+    /// reaches the device at once instead of waiting for its next poll.
+    fn push_settings(&self, addr: SocketAddr, volume: f32, delay_ms: u32) {
+        let sock = self.push_sock.lock().unwrap().clone();
+        if let Some(sock) = sock {
+            let resp = SettingsResponse { nonce: 0, volume, delay_ms };
+            if let Ok(bytes) = bincode::serialize(&resp) {
+                let _ = sock.send_to(&bytes, addr);
+            }
         }
     }
 
@@ -287,13 +355,7 @@ impl Default for ClientRegistry {
 /// Client side: repeatedly exchange timestamps with the server and feed the
 /// results into `clock`, applying any volume the server sends back to `volume`.
 /// Runs forever; intended to live on its own thread.
-pub fn run_client_sync(
-    server_ip: Ipv4Addr,
-    sync_port: u16,
-    clock: Arc<SyncedClock>,
-    volume: Arc<VolumeCell>,
-    delay_ms: Arc<AtomicU32>,
-) {
+pub fn run_client_sync(server_ip: Ipv4Addr, sync_port: u16, clock: Arc<SyncedClock>) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(s) => s,
         Err(e) => {
@@ -327,8 +389,6 @@ pub fn run_client_sync(
                     // offset = server_clock − midpoint of the client send/recv.
                     let offset = resp.server_ms as f64 - (t1 as f64 + t4 as f64) / 2.0;
                     clock.add_sample(offset, rtt);
-                    volume.set(resp.volume);
-                    delay_ms.store(resp.delay_ms, Ordering::Relaxed);
                 }
             }
         }
@@ -358,18 +418,87 @@ pub fn run_server_responder(sync_port: u16, registry: Arc<ClientRegistry>) {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 if let Ok(req) = bincode::deserialize::<TimeRequest>(&buf[..n]) {
-                    // Register the client (by IP) and read back its settings.
-                    let settings = match from {
-                        std::net::SocketAddr::V4(v4) => registry.touch(*v4.ip()),
-                        _ => ClientSettings {
-                            volume: 1.0,
-                            delay_ms: 0,
-                        },
-                    };
+                    // Register the client (by IP) for liveness / the web UI list.
+                    if let std::net::SocketAddr::V4(v4) = from {
+                        registry.touch(*v4.ip());
+                    }
                     let resp = TimeResponse {
                         client_send_ms: req.client_send_ms,
                         server_ms: now_epoch_ms(),
                         nonce: req.nonce,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&resp) {
+                        let _ = sock.send_to(&bytes, from);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("time-sync responder: recv error: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Client side: periodically ask the server for this client's settings
+/// (volume + delay) on the dedicated settings port and apply them. Kept
+/// separate from the time-sync exchange. Runs forever; intended for a thread.
+pub fn run_settings_client(
+    server_ip: Ipv4Addr,
+    settings_port: u16,
+    volume: Arc<VolumeCell>,
+    delay_ms: Arc<AtomicU32>,
+) {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("settings: could not bind socket: {e}");
+            return;
+        }
+    };
+    // Block up to the fallback interval per recv; a server push wakes us at once.
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(SETTINGS_INTERVAL_MS)));
+    let dest = (server_ip, settings_port);
+    let mut buf = [0u8; 256];
+    loop {
+        // Fallback poll / keepalive: lets the server learn our address (so it
+        // can push) and recovers any missed push.
+        let req = SettingsRequest { nonce: 0 };
+        if let Ok(bytes) = bincode::serialize(&req) {
+            let _ = sock.send_to(&bytes, dest);
+        }
+        // Apply every settings message the instant it lands (server pushes and
+        // the poll reply), until the socket is quiet for the interval.
+        loop {
+            match sock.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    if let Ok(resp) = bincode::deserialize::<SettingsResponse>(&buf[..n]) {
+                        volume.set(resp.volume);
+                        delay_ms.store(resp.delay_ms, Ordering::Relaxed);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Server side: answer settings requests, recording each client's address so
+/// changes can be pushed to it, and reply with its current settings. Runs
+/// forever; intended for its own thread. `sock` is the shared settings socket.
+pub fn run_settings_responder(sock: Arc<UdpSocket>, registry: Arc<ClientRegistry>) {
+    let mut buf = [0u8; 256];
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if bincode::deserialize::<SettingsRequest>(&buf[..n]).is_ok() {
+                    let settings = if let std::net::SocketAddr::V4(v4) = from {
+                        registry.record_settings_addr(*v4.ip(), from)
+                    } else {
+                        ClientSettings { volume: 1.0, delay_ms: 0 }
+                    };
+                    let resp = SettingsResponse {
+                        nonce: 0,
                         volume: settings.volume,
                         delay_ms: settings.delay_ms,
                     };
@@ -379,7 +508,7 @@ pub fn run_server_responder(sync_port: u16, registry: Arc<ClientRegistry>) {
                 }
             }
             Err(e) => {
-                eprintln!("time-sync responder: recv error: {e}");
+                eprintln!("settings responder: recv error: {e}");
                 return;
             }
         }

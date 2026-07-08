@@ -15,6 +15,9 @@ pub const DEFAULT_PORT: u16 = 5004;
 pub const DEFAULT_SYNC_PORT: u16 = 5005;
 /// Unicast port on the server that receives client telemetry reports.
 pub const DEFAULT_TELEMETRY_PORT: u16 = 5006;
+/// Unicast port on the server that answers per-client settings requests
+/// (volume + delay), kept separate from the time-sync exchange.
+pub const DEFAULT_SETTINGS_PORT: u16 = 5007;
 
 /// Target PCM payload per datagram. Kept well under a 1500-byte MTU (with room
 /// for the bincode header + IP/UDP headers) to avoid IP fragmentation.
@@ -112,12 +115,23 @@ pub struct TimeResponse {
     /// Server's local clock (epoch ms) when it answered (≈ T2 ≈ T3).
     pub server_ms: u64,
     pub nonce: u64,
-    /// This client's currently-assigned playback volume (0.0..=1.0), so volume
-    /// changes ride along with the periodic sync exchange.
+}
+
+/// Client -> server request for its current settings (volume + delay), sent on
+/// its own port so settings no longer piggyback on the time-sync reply.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SettingsRequest {
+    /// Correlates a response with its request.
+    pub nonce: u64,
+}
+
+/// The server's reply to a [`SettingsRequest`]: this client's assigned settings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SettingsResponse {
+    pub nonce: u64,
+    /// Assigned playback volume (0.0..=1.0).
     pub volume: f32,
-    /// This client's playback advance in milliseconds: the client plays each
-    /// packet this much *earlier* than its `play_at`, to compensate for the
-    /// latency between this computer and its speaker.
+    /// Playback advance in milliseconds (played this much earlier than play_at).
     pub delay_ms: u32,
 }
 

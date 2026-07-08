@@ -343,20 +343,15 @@
       );
     }
 
-    // PUT a client setting, debounced per (ip, field) so dragging a slider
-    // doesn't flood the server.
-    function useDebouncedPut() {
-      const timers = useRef({});
+    // PUT a client setting immediately on every state change (no debounce),
+    // so the server always has the latest volume/delay.
+    function useImmediatePut() {
       return useCallback((ip, field, body) => {
-        const key = ip + ":" + field;
-        clearTimeout(timers.current[key]);
-        timers.current[key] = setTimeout(() => {
-          fetch(`/api/clients/${ip}/${field}`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          }).catch(() => {});
-        }, 120);
+        fetch(`/api/clients/${ip}/${field}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).catch(() => {});
       }, []);
     }
 
@@ -367,7 +362,7 @@
       const [volumes, setVolumes] = useState({}); // ip -> 0..1, UI source of truth
       const [delays, setDelays] = useState({});   // ip -> ms, UI source of truth
       const [error, setError] = useState(null);
-      const putSetting = useDebouncedPut();
+      const putSetting = useImmediatePut();
 
       // Poll the client list and live telemetry together, once per second. The
       // server keeps the full ~60s of 10Hz history, so a 1s poll still yields

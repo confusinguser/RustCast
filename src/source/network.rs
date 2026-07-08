@@ -17,8 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::metrics::DeviceMetrics;
-use crate::sync::{SyncedClock, VolumeCell, run_client_sync};
-use crate::wire::{AudioPacket, DEFAULT_SYNC_PORT, now_epoch_ms};
+use crate::sync::{SyncedClock, VolumeCell, run_client_sync, run_settings_client};
+use crate::wire::{AudioPacket, DEFAULT_SETTINGS_PORT, DEFAULT_SYNC_PORT, now_epoch_ms};
 
 use super::Format;
 
@@ -115,17 +115,24 @@ impl NetworkSource {
             }
         };
 
-        // Start the time-sync thread now that we know the server's address.
+        // Start the time-sync and settings threads now that we know the server.
         let server_ip = *shared.server_ip.lock().unwrap();
         let sync = server_ip.map(|ip| {
             let clock = clock.clone();
+            thread::Builder::new()
+                .name("time-sync".into())
+                .spawn(move || run_client_sync(ip, DEFAULT_SYNC_PORT, clock))
+                .expect("spawn time-sync thread")
+        });
+        // Volume + delay arrive on their own channel, separate from time-sync.
+        if let Some(ip) = server_ip {
             let volume = volume.clone();
             let delay_ms = delay_ms.clone();
             thread::Builder::new()
-                .name("time-sync".into())
-                .spawn(move || run_client_sync(ip, DEFAULT_SYNC_PORT, clock, volume, delay_ms))
-                .expect("spawn time-sync thread")
-        });
+                .name("settings".into())
+                .spawn(move || run_settings_client(ip, DEFAULT_SETTINGS_PORT, volume, delay_ms))
+                .expect("spawn settings thread");
+        }
         if server_ip.is_none() {
             eprintln!("warning: could not determine server address; playing without clock sync");
         }

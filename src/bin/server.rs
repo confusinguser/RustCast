@@ -8,18 +8,18 @@ use std::net::{Ipv4Addr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::process::exit;
 
+use rustcast::api;
+use rustcast::metrics::{ServerMetrics, TelemetryStore, run_telemetry_receiver};
 use rustcast::source::librespot::LibrespotSource;
 use rustcast::source::pipe::PipeSource;
 use rustcast::source::{AudioSource, Format};
+use rustcast::sync::{ClientRegistry, run_server_responder, run_settings_responder};
+use rustcast::wire::{
+    AudioPacket, DEFAULT_GROUP, DEFAULT_PORT, DEFAULT_SETTINGS_PORT, DEFAULT_SYNC_PORT,
+    DEFAULT_TELEMETRY_PORT, TARGET_PCM_BYTES, WireFormat, now_epoch_ms,
+};
 use std::sync::Arc;
 use std::time::Duration;
-use rustcast::api;
-use rustcast::metrics::{ServerMetrics, TelemetryStore, run_telemetry_receiver};
-use rustcast::sync::{ClientRegistry, run_server_responder};
-use rustcast::wire::{
-    AudioPacket, DEFAULT_GROUP, DEFAULT_PORT, DEFAULT_SYNC_PORT, DEFAULT_TELEMETRY_PORT,
-    TARGET_PCM_BYTES, WireFormat, now_epoch_ms,
-};
 
 /// Port for the HTTP control API + web UI.
 const HTTP_PORT: u16 = 8080;
@@ -67,6 +67,17 @@ fn main() {
     {
         let reg = registry.clone();
         std::thread::spawn(move || run_server_responder(DEFAULT_SYNC_PORT, reg));
+    }
+    // Answer per-client settings (volume + delay) on their own port, and push
+    // changes to clients immediately over the same socket.
+    {
+        let settings_sock = Arc::new(
+            UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DEFAULT_SETTINGS_PORT))
+                .expect("bind settings socket"),
+        );
+        registry.set_push_socket(settings_sock.clone());
+        let reg = registry.clone();
+        std::thread::spawn(move || run_settings_responder(settings_sock, reg));
     }
     // Receive client telemetry reports into the store.
     {
@@ -152,7 +163,7 @@ fn main() {
         match samples {
             Ok(Some(samples)) => pending.extend_from_slice(&samples),
             Ok(None) if !have_pending_samples => break, // source ended
-            Ok(None) => {}, // flush pending samples, None because of timeout
+            Ok(None) => pending.clear(), // flush pending samples, None because of timeout
             Err(e) => {
                 eprintln!("source error: {e}");
                 break;
@@ -160,7 +171,9 @@ fn main() {
         }
 
         while pending.len() > 0 {
-            let chunk: Vec<f32> = pending.drain(..samples_per_packet.min(pending.len())).collect();
+            let chunk: Vec<f32> = pending
+                .drain(..samples_per_packet.min(pending.len()))
+                .collect();
 
             // When this chunk's audio should start playing, and when we should
             // actually put it on the wire (SEND_LEAD_MS earlier). Pace sending
