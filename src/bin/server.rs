@@ -211,11 +211,21 @@ fn main() {
     eprintln!("all source streams ended; exiting.");
 }
 
-/// The nominal (channels, sample_rate) advertised for a source. Pipe takes it
+/// The nominal (channels, sample_rate) advertised for a source. Most take it
 /// from config; Spotify decodes at a fixed 44.1 kHz stereo.
 fn nominal_format(kind: &SourceKind) -> (u16, u32) {
     match kind {
         SourceKind::Pipe {
+            channels,
+            sample_rate,
+            ..
+        }
+        | SourceKind::Sink {
+            channels,
+            sample_rate,
+            ..
+        }
+        | SourceKind::Mic {
             channels,
             sample_rate,
             ..

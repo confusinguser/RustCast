@@ -4,6 +4,7 @@ use std::time::Duration;
 pub mod librespot;
 pub mod network;
 pub mod pipe;
+pub mod pulse;
 
 /// Format of an interleaved-sample stream. Assumed stable for the lifetime of
 /// a given source.

@@ -63,6 +63,31 @@ pub enum SourceKind {
         #[serde(default = "default_spotify_format")]
         format: String,
     },
+    /// A virtual playback device (null sink) registered with the audio server:
+    /// apps can select it as an output, and everything routed to it is streamed.
+    Sink {
+        /// The sink name apps see (keep it simple: no spaces).
+        #[serde(default = "default_sink_name")]
+        device_name: String,
+        #[serde(default = "default_format")]
+        format: String,
+        #[serde(default = "default_channels")]
+        channels: u16,
+        #[serde(default = "default_sample_rate")]
+        sample_rate: u32,
+    },
+    /// A capture device (microphone / line-in) whose audio is streamed.
+    Mic {
+        /// Audio-server source name to capture; the default input if omitted.
+        #[serde(default)]
+        device: Option<String>,
+        #[serde(default = "default_format")]
+        format: String,
+        #[serde(default = "default_channels")]
+        channels: u16,
+        #[serde(default = "default_sample_rate")]
+        sample_rate: u32,
+    },
 }
 
 impl SourceKind {
@@ -71,6 +96,8 @@ impl SourceKind {
         match self {
             SourceKind::Pipe { .. } => "pipe",
             SourceKind::Spotify { .. } => "spotify",
+            SourceKind::Sink { .. } => "sink",
+            SourceKind::Mic { .. } => "mic",
         }
     }
 
@@ -79,6 +106,8 @@ impl SourceKind {
         match self {
             SourceKind::Pipe { format, .. } => format,
             SourceKind::Spotify { format, .. } => format,
+            SourceKind::Sink { format, .. } => format,
+            SourceKind::Mic { format, .. } => format,
         }
     }
 }
@@ -156,5 +185,8 @@ fn default_sample_rate() -> u32 {
     44_100
 }
 fn default_device_name() -> String {
+    "RustCast".into()
+}
+fn default_sink_name() -> String {
     "RustCast".into()
 }

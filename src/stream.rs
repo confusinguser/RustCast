@@ -12,6 +12,7 @@ use crate::metrics::ServerMetrics;
 use crate::net::set_multicast_if;
 use crate::source::librespot::LibrespotSource;
 use crate::source::pipe::PipeSource;
+use crate::source::pulse::{PulseKind, PulseSource};
 use crate::source::{AudioSource, Format};
 use crate::wire::{AUDIO_PORT, AudioPacket, TARGET_PCM_BYTES, WireFormat, now_epoch_ms};
 
@@ -41,6 +42,34 @@ pub fn open_source(kind: &SourceKind) -> std::io::Result<Box<dyn AudioSource>> {
         SourceKind::Spotify { device_name, .. } => {
             Ok(Box::new(LibrespotSource::new(device_name.clone())?))
         }
+        SourceKind::Sink {
+            device_name,
+            channels,
+            sample_rate,
+            ..
+        } => Ok(Box::new(PulseSource::open(
+            PulseKind::Sink {
+                sink_name: device_name.clone(),
+            },
+            Format {
+                channels: *channels,
+                sample_rate: *sample_rate,
+            },
+        )?)),
+        SourceKind::Mic {
+            device,
+            channels,
+            sample_rate,
+            ..
+        } => Ok(Box::new(PulseSource::open(
+            PulseKind::Source {
+                device: device.clone(),
+            },
+            Format {
+                channels: *channels,
+                sample_rate: *sample_rate,
+            },
+        )?)),
     }
 }
 
