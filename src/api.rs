@@ -5,20 +5,23 @@
 //! it. Same-origin as the API, so no CORS is needed.
 
 use std::net::{Ipv4Addr, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use poem::http::StatusCode;
 use poem::listener::TcpListener;
+use poem::web::sse::{Event, SSE};
 use poem::web::{Data, Html, Json, Path};
 use poem::{EndpointExt, Route, Server, get, handler, put};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogStore;
 use crate::clients::{ClientStore, mac_hex, parse_mac_hex};
-use crate::metrics::{SourceMeta, StatsSnapshot, TelemetryStore, WebActivity};
+use crate::config::Config;
+use crate::metrics::{SourceMeta, TelemetryStore};
 use crate::net::set_multicast_if;
-use crate::wire::{CONTROL_GROUP, CONTROL_PORT, ControlCommand, MAX_DELAY_MS, WireFormat};
+use crate::stream::SendParams;
+use crate::wire::{CONTROL_GROUP, CONTROL_PORT, ControlCommand, MAX_LEAD_MS, WireFormat};
 
 /// The single-page UI, compiled into the binary.
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -103,12 +106,8 @@ struct SourceDto {
     sample_rate: u32,
     channels: u16,
     format: String,
-}
-
-#[derive(Serialize)]
-struct ClientsResponse {
-    clients: Vec<ClientDto>,
-    catalog: Vec<SourceDto>,
+    /// Send lead (ms) — the cap for a client's delay slider when it plays this.
+    lead_ms: u32,
 }
 
 #[derive(Deserialize)]
@@ -133,22 +132,35 @@ struct NameBody {
     name: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SendBody {
+    /// Any subset; omitted fields are left unchanged.
+    #[serde(default)]
+    lead_ms: Option<u64>,
+    #[serde(default)]
+    redundancy: Option<u32>,
+    #[serde(default)]
+    last_lead_ms: Option<u64>,
+    #[serde(default)]
+    unicast: Option<bool>,
+}
+
+/// A local source the UI can control the send timing of.
+pub struct SourceControl {
+    pub id: u64,
+    /// Index into `Config::sources`, for persisting edits back to the yaml.
+    pub cfg_index: usize,
+    pub params: Arc<SendParams>,
+}
+
 #[handler]
 fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-/// The client list (from telemetry) plus the global source catalog for the
-/// per-client dropdown. Doubles as the web-user heartbeat.
-#[handler]
-fn list_clients(
-    Data(store): Data<&Arc<TelemetryStore>>,
-    Data(catalog): Data<&Arc<CatalogStore>>,
-    Data(clients_store): Data<&Arc<ClientStore>>,
-    Data(activity): Data<&Arc<WebActivity>>,
-) -> Json<ClientsResponse> {
-    activity.touch();
-    let clients = store
+/// The client-meta list (from telemetry) with display names from the store.
+fn client_dtos(store: &TelemetryStore, clients_store: &ClientStore) -> Vec<ClientDto> {
+    store
         .clients_summary()
         .into_iter()
         .map(|c| {
@@ -173,8 +185,12 @@ fn list_clients(
                 },
             }
         })
-        .collect();
-    let catalog = catalog
+        .collect()
+}
+
+/// The global source catalog for the UI dropdown.
+fn catalog_dtos(catalog: &CatalogStore) -> Vec<SourceDto> {
+    catalog
         .snapshot()
         .into_iter()
         .map(|r| SourceDto {
@@ -184,37 +200,123 @@ fn list_clients(
             sample_rate: r.entry.sample_rate,
             channels: r.entry.channels,
             format: format_str(r.entry.format).to_string(),
+            lead_ms: r.entry.lead_ms,
         })
-        .collect();
-    Json(ClientsResponse { clients, catalog })
+        .collect()
 }
 
-/// Live telemetry for the graphs: per-source server send-path history plus each
-/// device's recent buffer/sample history. Also a heartbeat.
-#[handler]
-fn stats(
-    Data(store): Data<&Arc<TelemetryStore>>,
-    Data(catalog): Data<&Arc<CatalogStore>>,
-    Data(sid): Data<&Arc<LocalServerId>>,
-    Data(activity): Data<&Arc<WebActivity>>,
-) -> Json<StatsSnapshot> {
-    activity.touch();
-    // Every source in the catalog (local + remote) gets a send-path card; the
-    // history comes from local sampling for our own sources and from the stats
-    // broadcast for others.
-    let sources: Vec<SourceMeta> = catalog
+/// Send-path source metadata (local + remote), for the per-source cards.
+fn source_metas(catalog: &CatalogStore, controls: &[SourceControl], my_id: u64) -> Vec<SourceMeta> {
+    catalog
         .snapshot()
         .into_iter()
-        .map(|r| SourceMeta {
-            id: r.entry.source_id,
-            name: r.entry.name,
-            sample_rate: r.entry.sample_rate,
-            channels: r.entry.channels,
-            lead_ms: r.entry.lead_ms,
-            remote: r.server_id != sid.0,
+        .map(|r| {
+            let local = controls.iter().find(|c| c.id == r.entry.source_id);
+            SourceMeta {
+                id: r.entry.source_id,
+                name: r.entry.name,
+                sample_rate: r.entry.sample_rate,
+                channels: r.entry.channels,
+                lead_ms: r.entry.lead_ms,
+                redundancy: local.map(|c| c.params.redundancy()).unwrap_or(0),
+                last_lead_ms: local.map(|c| c.params.last_lead()).unwrap_or(0),
+                unicast: local.map(|c| c.params.unicast()).unwrap_or(false),
+                remote: r.server_id != my_id,
+            }
         })
-        .collect();
-    Json(store.snapshot(&sources))
+        .collect()
+}
+
+/// One SSE payload. `kind` is "snapshot" (full history, applied fresh) or "delta"
+/// (only samples newer than the client's cursor, appended). Meta (client list +
+/// catalog) is small and included every time so the UI stays current.
+#[derive(Serialize)]
+struct EventPayload {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    now_ms: u64,
+    server: Vec<StatsSnapshotServer>,
+    clients_hist: Vec<StatsSnapshotClient>,
+    clients: Vec<ClientDto>,
+    catalog: Vec<SourceDto>,
+}
+// Aliases so the SSE payload reuses the store's history structs.
+type StatsSnapshotServer = crate::metrics::ServerSourceStats;
+type StatsSnapshotClient = crate::metrics::ClientStats;
+
+/// Live stats subscription (Server-Sent Events). On connect the server pushes one
+/// `snapshot` with the full ~60 s history, then `delta` events every ~200 ms
+/// carrying only new samples (per-source and per-client cursors) plus fresh meta.
+/// An open connection is the "someone's watching" signal.
+#[handler]
+fn events(
+    Data(store): Data<&Arc<TelemetryStore>>,
+    Data(catalog): Data<&Arc<CatalogStore>>,
+    Data(clients_store): Data<&Arc<ClientStore>>,
+    Data(controls): Data<&Arc<Vec<SourceControl>>>,
+    Data(sid): Data<&Arc<LocalServerId>>,
+) -> SSE {
+    struct St {
+        store: Arc<TelemetryStore>,
+        catalog: Arc<CatalogStore>,
+        clients_store: Arc<ClientStore>,
+        controls: Arc<Vec<SourceControl>>,
+        my_id: u64,
+        first: bool,
+        // cursors: highest sample `t` already sent, per source id / per client mac.
+        server_cur: std::collections::HashMap<String, u64>,
+        client_cur: std::collections::HashMap<String, u64>,
+    }
+    let st = St {
+        store: store.clone(),
+        catalog: catalog.clone(),
+        clients_store: clients_store.clone(),
+        controls: controls.clone(),
+        my_id: sid.0,
+        first: true,
+        server_cur: std::collections::HashMap::new(),
+        client_cur: std::collections::HashMap::new(),
+    };
+
+    let stream = futures::stream::unfold(st, |mut st| async move {
+        if !st.first {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let metas = source_metas(&st.catalog, &st.controls, st.my_id);
+        let snap = st.store.snapshot(&metas); // full histories
+
+        // Keep only samples past each cursor, then advance the cursors.
+        let mut server = snap.server;
+        for s in &mut server {
+            let cur = st.server_cur.entry(s.source_id.clone()).or_insert(0);
+            s.samples.retain(|x| x.t > *cur);
+            if let Some(last) = s.samples.last() {
+                *cur = last.t;
+            }
+        }
+        let mut clients_hist = snap.clients;
+        for c in &mut clients_hist {
+            let cur = st.client_cur.entry(c.mac.clone()).or_insert(0);
+            c.samples.retain(|x| x.t > *cur);
+            if let Some(last) = c.samples.last() {
+                *cur = last.t;
+            }
+        }
+
+        let payload = EventPayload {
+            kind: if st.first { "snapshot" } else { "delta" },
+            now_ms: snap.now_ms,
+            server,
+            clients_hist,
+            clients: client_dtos(&st.store, &st.clients_store),
+            catalog: catalog_dtos(&st.catalog),
+        };
+        st.first = false;
+        let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+        Some((Event::message(json), st))
+    });
+
+    SSE::new(stream).keep_alive(std::time::Duration::from_secs(15))
 }
 
 /// Parse a MAC path param into its normalized key form.
@@ -250,7 +352,8 @@ fn set_delay(
 ) -> poem::Result<StatusCode> {
     let m = mac_key(&mac)?;
     let key = mac_hex(m);
-    let d = body.delay_ms.min(MAX_DELAY_MS);
+    // Sanity ceiling only; the client re-clamps to its selected source's lead.
+    let d = body.delay_ms.min(MAX_LEAD_MS as u32);
     clients_store.set_delay(&key, d);
     if let Some(ip) = store.ip_for_mac(m) {
         control.send(ip, None, None, Some(d));
@@ -291,6 +394,52 @@ fn set_name(
     Ok(StatusCode::OK)
 }
 
+/// Adjust a *local* source's send timing (lead / redundancy / last-copy lead),
+/// applying it live and persisting it to the yaml config. 404 for a source id
+/// this server doesn't host.
+#[handler]
+fn set_send(
+    Path(id): Path<String>,
+    Data(controls): Data<&Arc<Vec<SourceControl>>>,
+    Data(config): Data<&Arc<Mutex<Config>>>,
+    Data(cfg_path): Data<&Arc<String>>,
+    Json(body): Json<SendBody>,
+) -> poem::Result<StatusCode> {
+    let id: u64 = id
+        .parse()
+        .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?;
+    let ctl = controls
+        .iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| poem::Error::from_status(StatusCode::NOT_FOUND))?;
+    if let Some(v) = body.lead_ms {
+        ctl.params.set_lead(v);
+    }
+    if let Some(v) = body.redundancy {
+        ctl.params.set_redundancy(v);
+    }
+    if let Some(v) = body.last_lead_ms {
+        ctl.params.set_last_lead(v);
+    }
+    if let Some(v) = body.unicast {
+        ctl.params.set_unicast(v);
+    }
+    // Persist the (clamped) live values back to the config file.
+    {
+        let mut cfg = config.lock().unwrap();
+        if let Some(sc) = cfg.sources.get_mut(ctl.cfg_index) {
+            sc.lead_ms = ctl.params.lead();
+            sc.redundancy = ctl.params.redundancy();
+            sc.last_lead_ms = ctl.params.last_lead();
+            sc.unicast = ctl.params.unicast();
+        }
+        if let Err(e) = cfg.save(cfg_path.as_str()) {
+            eprintln!("could not persist config: {e}");
+        }
+    }
+    Ok(StatusCode::OK)
+}
+
 /// Run the HTTP server on its own tokio runtime. Blocks; intended for a thread.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -298,25 +447,29 @@ pub fn run(
     catalog: Arc<CatalogStore>,
     telemetry: Arc<TelemetryStore>,
     clients_store: Arc<ClientStore>,
-    activity: Arc<WebActivity>,
     control: Arc<ControlSender>,
+    controls: Arc<Vec<SourceControl>>,
+    config: Arc<Mutex<Config>>,
+    config_path: String,
     port: u16,
 ) {
     let rt = tokio::runtime::Runtime::new().expect("build api runtime");
     rt.block_on(async move {
         let app = Route::new()
             .at("/", get(index))
-            .at("/api/clients", get(list_clients))
-            .at("/api/stats", get(stats))
+            .at("/api/events", get(events))
             .at("/api/clients/:mac/volume", put(set_volume))
             .at("/api/clients/:mac/delay", put(set_delay))
             .at("/api/clients/:mac/source", put(set_source))
             .at("/api/clients/:mac/name", put(set_name))
+            .at("/api/sources/:id/send", put(set_send))
             .data(catalog)
             .data(telemetry)
             .data(clients_store)
-            .data(activity)
             .data(control)
+            .data(controls)
+            .data(config)
+            .data(Arc::new(config_path))
             .data(Arc::new(LocalServerId(server_id)));
 
         println!("HTTP API + UI on http://0.0.0.0:{port}");

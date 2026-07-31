@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::net::{bind_reuse, set_multicast_if};
+use crate::stream::SendParams;
 use crate::wire::{ANNOUNCE_GROUP, ANNOUNCE_PORT, CatalogAnnounce, CatalogEntry, now_epoch_ms};
 
 /// How often a server re-advertises its catalog.
@@ -116,6 +117,15 @@ impl CatalogStore {
     pub fn resolve(&self, id: u64) -> Option<ResolvedSource> {
         self.snapshot().into_iter().find(|r| r.entry.source_id == id)
     }
+
+    /// IPs of every server currently heard (for the client's TCP telemetry fan-out).
+    pub fn server_ips(&self) -> Vec<Ipv4Addr> {
+        let mut m = self.remote.lock().unwrap();
+        m.retain(|_, r| r.last_seen.elapsed() < ANNOUNCE_STALE);
+        m.values()
+            .map(|r| Ipv4Addr::from(r.announce.server_ip))
+            .collect()
+    }
 }
 
 impl Default for CatalogStore {
@@ -124,12 +134,14 @@ impl Default for CatalogStore {
     }
 }
 
-/// Server: multicast this server's catalog every [`ANNOUNCE_INTERVAL_MS`]. Runs
-/// forever; intended for its own thread.
+/// Server: multicast this server's catalog every [`ANNOUNCE_INTERVAL_MS`]. Each
+/// source's `lead_ms` is read live from its [`SendParams`], so a lead adjusted
+/// from the UI propagates to clients on the next announcement. Runs forever;
+/// intended for its own thread.
 pub fn run_catalog_announcer(
     server_id: u64,
     sync_port: u16,
-    sources: Arc<Vec<CatalogEntry>>,
+    sources: Arc<Vec<(CatalogEntry, Arc<SendParams>)>>,
     iface: Ipv4Addr,
 ) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
@@ -147,12 +159,20 @@ pub fn run_catalog_announcer(
     }
     let dest = (ANNOUNCE_GROUP, ANNOUNCE_PORT);
     loop {
+        let entries: Vec<CatalogEntry> = sources
+            .iter()
+            .map(|(e, p)| {
+                let mut e = e.clone();
+                e.lead_ms = p.lead() as u32;
+                e
+            })
+            .collect();
         let announce = CatalogAnnounce {
             server_id,
             server_ip: [0, 0, 0, 0], // the receiver fills this from the datagram source
             sync_port,
             sent_ms: now_epoch_ms(),
-            sources: (*sources).clone(),
+            sources: entries,
         };
         if let Ok(bytes) = bincode::serialize(&announce) {
             let _ = sock.send_to(&bytes, dest);

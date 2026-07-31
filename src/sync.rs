@@ -11,10 +11,10 @@
 //! it and reflects the new value in its telemetry. The sync exchange re-points
 //! to whichever server owns the currently-selected source via [`SyncTarget`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::metrics::DeviceMetrics;
 use crate::wire::{ControlCommand, MAX_DELAY_MS, TimeRequest, TimeResponse, now_epoch_ms};
@@ -111,9 +111,11 @@ impl SyncedClock {
             s.target_offset_ms = best.offset_ms;
         }
 
-        if !s.initialized {
-            // First estimate: adopt it directly. Playback hasn't started relying
-            // on the clock yet, so there is nothing to slew smoothly from.
+        // Don't apply an offset (or let playback start) until the full warmup
+        // window is collected: a single early sample can be badly skewed, and
+        // adopting it would jump playback. Once WARMUP_SAMPLES are in, adopt the
+        // best (lowest-RTT) estimate directly, then slew from there.
+        if !s.initialized && s.samples.len() >= WARMUP_SAMPLES {
             s.applied_offset_ms = s.target_offset_ms;
             s.last_local_ms = now_epoch_ms() as f64;
             s.initialized = true;
@@ -221,6 +223,10 @@ struct SettingsInner {
     volume_dirty: bool,
     /// Bumped on every actual selection change; the watcher keys off it.
     selection_epoch: u64,
+    /// Send lead (ms) of the currently-selected source: the cap on `delay_ms`,
+    /// since a device can't play earlier than the buffered lead. Kept current by
+    /// the selection watcher from the catalog.
+    active_lead_ms: u32,
 }
 
 impl ClientSettings {
@@ -232,6 +238,7 @@ impl ClientSettings {
                 delay_ms: 0,
                 volume_dirty: true, // apply the initial volume once at startup
                 selection_epoch: 0,
+                active_lead_ms: MAX_DELAY_MS,
             }),
             cv: Condvar::new(),
         }
@@ -249,6 +256,11 @@ impl ClientSettings {
 
     pub fn delay_ms(&self) -> u32 {
         self.inner.lock().unwrap().delay_ms
+    }
+
+    /// Send lead (ms) of the selected source — the total-buffer budget basis.
+    pub fn active_lead_ms(&self) -> u32 {
+        self.inner.lock().unwrap().active_lead_ms
     }
 
     /// The current volume if it changed since the last call, clearing the flag.
@@ -273,7 +285,17 @@ impl ClientSettings {
 
     fn set_delay(&self, ms: u32) {
         let mut s = self.inner.lock().unwrap();
-        s.delay_ms = ms.min(MAX_DELAY_MS);
+        s.delay_ms = ms.min(s.active_lead_ms);
+    }
+
+    /// Update the cap on `delay_ms` to the selected source's send lead, and
+    /// re-clamp the current delay to it. Called by the selection watcher.
+    pub fn set_active_lead(&self, lead_ms: u32) {
+        let mut s = self.inner.lock().unwrap();
+        s.active_lead_ms = lead_ms;
+        if s.delay_ms > lead_ms {
+            s.delay_ms = lead_ms;
+        }
     }
 
     /// Select a source (0 = off). Bumps the epoch and wakes the watcher only on
@@ -328,6 +350,7 @@ impl Default for ClientSettings {
 pub fn run_client_sync(
     target: Arc<SyncTarget>,
     clock: Arc<SyncedClock>,
+    settings: Arc<ClientSettings>,
     metrics: Arc<DeviceMetrics>,
 ) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
@@ -364,6 +387,7 @@ pub fn run_client_sync(
         let req = TimeRequest {
             client_send_ms: t1,
             nonce,
+            selected_source_id: settings.selected(),
         };
         if let Ok(bytes) = bincode::serialize(&req) {
             let _ = sock.send_to(&bytes, dest);
@@ -400,10 +424,65 @@ pub fn run_client_sync(
     }
 }
 
-/// Server side: answer time-sync requests with the current server clock. Runs
-/// forever, unconditionally (a client can't start playing without it), on its
-/// own thread.
-pub fn run_server_responder(sync_port: u16) {
+/// How long a client counts as a listener of a source after its last time-sync
+/// request naming it. A few sync intervals, so a dropped request is tolerated.
+const LISTENER_TTL: Duration = Duration::from_secs(3);
+
+/// Which clients are currently listening to each local source, learned from the
+/// `selected_source_id` on their time-sync requests. Lets the server stop an
+/// unheard source and target unicast mode.
+pub struct Listeners {
+    inner: Mutex<HashMap<u64, HashMap<Ipv4Addr, Instant>>>,
+}
+
+impl Listeners {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record that `ip` is listening to `source_id` (0 = none, ignored).
+    pub fn touch(&self, source_id: u64, ip: Ipv4Addr) {
+        if source_id == 0 {
+            return;
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .entry(source_id)
+            .or_default()
+            .insert(ip, Instant::now());
+    }
+
+    /// Current listener IPs for a source (pruned to [`LISTENER_TTL`]).
+    pub fn listeners(&self, source_id: u64) -> Vec<Ipv4Addr> {
+        let mut map = self.inner.lock().unwrap();
+        let now = Instant::now();
+        if let Some(set) = map.get_mut(&source_id) {
+            set.retain(|_, seen| now.duration_since(*seen) < LISTENER_TTL);
+            set.keys().copied().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether any client is currently listening to this source.
+    pub fn has_listener(&self, source_id: u64) -> bool {
+        !self.listeners(source_id).is_empty()
+    }
+}
+
+impl Default for Listeners {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Server side: answer time-sync requests with the current server clock, and
+/// record the requester as a listener of the source it named. Runs forever,
+/// unconditionally (a client can't start playing without it), on its own thread.
+pub fn run_server_responder(sync_port: u16, listeners: Arc<Listeners>) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, sync_port)) {
         Ok(s) => s,
         Err(e) => {
@@ -416,6 +495,9 @@ pub fn run_server_responder(sync_port: u16) {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 if let Ok(req) = bincode::deserialize::<TimeRequest>(&buf[..n]) {
+                    if let std::net::SocketAddr::V4(v4) = from {
+                        listeners.touch(req.selected_source_id, *v4.ip());
+                    }
                     let resp = TimeResponse {
                         client_send_ms: req.client_send_ms,
                         server_ms: now_epoch_ms(),

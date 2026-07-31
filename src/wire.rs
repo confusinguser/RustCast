@@ -8,11 +8,10 @@
 //! - **Catalog** (server → everyone, [`ANNOUNCE_GROUP`]): each server periodically
 //!   multicasts its [`CatalogAnnounce`] so clients and other servers learn the full
 //!   set of available sources across the LAN.
-//! - **Telemetry** (clients → servers, unicast on [`TELEMETRY_PORT`]): while a web
-//!   user watches, the server multicasts a [`TelemetryRequest`] ping on
-//!   [`TELEMETRY_REQ_GROUP`]; each client replies by *unicasting* its
-//!   [`TelemetryReport`] to that server for a short grace period, refreshed by
-//!   each ping. Unicast avoids the loss/jitter of multicast (esp. over Wi-Fi).
+//! - **Telemetry** (clients → servers, TCP on [`TELEMETRY_PORT`]): each client
+//!   keeps a persistent TCP connection to every server it hears in the catalog and
+//!   streams length-prefixed [`TelemetryReport`]s. TCP gives timely, reliable
+//!   delivery (no multicast loss); the browser subscribes to the server via SSE.
 //! - **Control** (server → clients, [`CONTROL_GROUP`]): the web UI mutates a client's
 //!   settings by multicasting a [`ControlCommand`]; the client applies it and reflects
 //!   the new value in its next telemetry report.
@@ -37,20 +36,20 @@ pub const ANNOUNCE_PORT: u16 = 5008;
 /// Control commands (server → clients).
 pub const CONTROL_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 101);
 pub const CONTROL_PORT: u16 = 5009;
-/// Unicast port a client sends its telemetry reports to (the requesting server).
+/// TCP port each server listens on for client telemetry. Clients keep a
+/// persistent connection to every server and stream length-prefixed reports.
 pub const TELEMETRY_PORT: u16 = 5006;
-/// Server → clients telemetry request ("ping"), multicast while a web user is
-/// watching; clients unicast telemetry back in response.
-pub const TELEMETRY_REQ_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 104);
-pub const TELEMETRY_REQ_PORT: u16 = 5012;
 /// Server send-path stats (server → servers), so any UI can graph every
 /// server's streams, not just its own.
 pub const STATS_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 103);
 pub const STATS_PORT: u16 = 5011;
 
-/// Max playback advance (ms). A client can only skip forward into audio it has
-/// already buffered, so this must stay comfortably below the server's send lead.
+/// Default max playback advance (ms), used as the client's delay cap until it
+/// has selected a source (after which the cap is that source's live send lead).
 pub const MAX_DELAY_MS: u32 = 150;
+/// Absolute ceiling on the (runtime-adjustable) send lead, in ms. Also bounds
+/// each device's delay slider, since delay can't exceed the buffered lead.
+pub const MAX_LEAD_MS: u64 = 1500;
 
 /// Target PCM payload per datagram. Kept well under a 1500-byte MTU (with room
 /// for the bincode header + IP/UDP headers) to avoid IP fragmentation.
@@ -134,13 +133,18 @@ pub struct AudioPacket {
     pub data: Vec<u8>,
 }
 
-/// NTP-style time-sync request sent by a client to the server (unicast).
+/// NTP-style time-sync request sent by a client to the server (unicast). Also
+/// carries the client's currently-selected source, so the owning server learns
+/// its listeners (and their IPs) from the always-on sync traffic — used to stop
+/// idle sources and to target unicast mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeRequest {
     /// Client's local clock (epoch ms) at send time (T1).
     pub client_send_ms: u64,
     /// Correlates a response with its request.
     pub nonce: u64,
+    /// The source this client is currently playing (0 = none).
+    pub selected_source_id: u64,
 }
 
 /// The server's reply to a [`TimeRequest`].
@@ -223,18 +227,7 @@ pub struct ControlCommand {
     pub set_delay_ms: Option<u32>,
 }
 
-/// Server → clients ping. While a web user is watching, the server multicasts
-/// this (~1 Hz) on [`TELEMETRY_REQ_GROUP`]; a client that receives it unicasts
-/// its [`TelemetryReport`] to the ping's source for a short grace window,
-/// refreshed by each subsequent ping. When pings stop, the client stops sending.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct TelemetryRequest {
-    /// The requesting server's id (for logging / dedup); the client replies to
-    /// the datagram's source address regardless.
-    pub server_id: u64,
-}
-
-/// A telemetry snapshot a client unicasts to a requesting server (~10 Hz) so
+/// A telemetry snapshot a client streams to every server over TCP (~10 Hz) so
 /// the web UI can graph each device's buffers and sample flow live. Counters are
 /// cumulative since the client started; gauges are the instantaneous value at
 /// report time. Also carries the client's self-owned settings, since with many

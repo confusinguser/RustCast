@@ -18,14 +18,22 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #0f1115; color: #e6e8ec;
     }
-    .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
-    header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 24px; }
-    h1 { font-size: 24px; margin: 0; letter-spacing: -0.02em; }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+    header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+    h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
     .sub { color: #8b909a; font-size: 13px; }
-    .sectitle { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #7d838f; margin: 22px 2px 8px; }
+    /* Two columns (streams | clients), collapsing to one on narrow screens. */
+    .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+    @media (max-width: 820px) { .columns { grid-template-columns: 1fr; } }
+    .col { min-width: 0; }
+    .sectitle {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #7d838f;
+      margin: 0 2px 10px; padding-bottom: 6px; border-bottom: 1px solid #232833;
+      position: sticky; top: 0; background: #0f1115; z-index: 1;
+    }
     .card {
-      background: #171a21; border: 1px solid #262b36; border-radius: 12px;
-      padding: 16px 18px; margin-bottom: 12px;
+      background: #171a21; border: 1px solid #2a3040; border-radius: 10px;
+      padding: 12px 14px; margin-bottom: 10px;
     }
     .card.server { border-color: #2f3a2f; }
     .row { display: flex; align-items: center; gap: 12px; }
@@ -42,7 +50,12 @@
     .name-input:focus { border-color: #4c8bf5; background: #10131a; outline: none; }
     .title { font-size: 15px; font-weight: 600; }
     .meta { color: #8b909a; font-size: 12px; margin-left: auto; }
-    .slider-row { display: flex; align-items: center; gap: 14px; margin-top: 14px; }
+    .slider-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+    .send-controls { margin-top: 10px; padding: 10px 12px; background: #12161d; border: 1px solid #222833; border-radius: 8px; }
+    .send-controls .slider-row:first-child { margin-top: 0; }
+    input[type=range]:disabled { opacity: 0.4; }
+    .check-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: #c7ccd6; cursor: pointer; }
+    .check-row input { accent-color: #4c8bf5; }
     .label { width: 38px; font-size: 12px; color: #8b909a; flex: none; }
     input[type=range] { flex: 1; accent-color: #4c8bf5; height: 4px; }
     select {
@@ -266,21 +279,55 @@
 
     // ---- per-source server card --------------------------------------------
 
-    function ServerSourceCard({ src, clockOffset }) {
+    function ServerSourceCard({ src, sp, clockOffset, onSend }) {
       const s = src.samples || [];
       const latest = s[s.length - 1];
       const sendRate = rateSeries(s, "packets_sent");
       const lastRate = sendRate.length ? sendRate[sendRate.length - 1].y : 0;
       const reanchors = latest ? latest.reanchors : 0;
+      // Send-timing values: optimistic local state falls back to reported.
+      const lead = sp?.lead_ms ?? src.lead_ms;
+      const redundancy = sp?.redundancy ?? src.redundancy ?? 1;
+      const lastLead = sp?.last_lead_ms ?? src.last_lead_ms ?? 0;
+      const unicast = sp?.unicast ?? src.unicast ?? false;
       return (
         <div className="card server">
           <div className="row">
             <span className="dot on"></span>
             <span className="title">{src.name}{src.remote ? " · remote" : ""}</span>
             <span className="meta">
-              {src.sample_rate ? `${src.sample_rate} Hz · ${src.channels}ch · ${src.lead_ms}ms lead` : ""}
+              {src.sample_rate ? `${src.sample_rate} Hz · ${src.channels}ch · ${lead}ms lead` : ""}
             </span>
           </div>
+          {!src.remote && (
+            <div className="send-controls">
+              <div className="slider-row">
+                <span className="label">Lead</span>
+                <input type="range" min="1" max="1500" step="1" value={lead}
+                  onChange={(e) => onSend(src.source_id, { lead_ms: Number(e.target.value) })} />
+                <span className="pct">{lead}ms</span>
+              </div>
+              <div className="slider-row">
+                <span className="label">Copies</span>
+                <input type="range" min="1" max="8" step="1" value={redundancy}
+                  onChange={(e) => onSend(src.source_id, { redundancy: Number(e.target.value) })} />
+                <span className="pct">{redundancy}×</span>
+              </div>
+              <div className="slider-row" title="How long before play time the last copy is sent">
+                <span className="label">Last</span>
+                <input type="range" min="0" max={Math.max(0, lead - 1)} step="1"
+                  value={Math.min(lastLead, Math.max(0, lead - 1))}
+                  disabled={redundancy < 2}
+                  onChange={(e) => onSend(src.source_id, { last_lead_ms: Number(e.target.value) })} />
+                <span className="pct">{lastLead}ms</span>
+              </div>
+              <label className="check-row" title="Stream by unicast to each listening client instead of multicast">
+                <input type="checkbox" checked={unicast}
+                  onChange={(e) => onSend(src.source_id, { unicast: e.target.checked })} />
+                <span>Unicast to listeners</span>
+              </label>
+            </div>
+          )}
           <div className="stats">
             <div className="readouts">
               <div className="stat"><span className="k">Send rate</span><span className="v">{lastRate.toFixed(0)} pkt/s</span></div>
@@ -387,7 +434,7 @@
       );
     }
 
-    function Client({ c, st, catalog, clockOffset, volume, delay, onSource, onVolume, onDelay, onName }) {
+    function Client({ c, st, catalog, clockOffset, volume, delay, delayMax, onSource, onVolume, onDelay, onName }) {
       return (
         <div className="card">
           <div className="row">
@@ -421,8 +468,12 @@
           </div>
           <div className="slider-row">
             <span className="label">Delay</span>
+            {/* Max = the selected source's send lead (can't play earlier than
+                the buffered lead); disabled when Off / source unknown. */}
             <input
-              type="range" min="0" max="150" step="1" value={delay}
+              type="range" min="0" max={delayMax || 0} step="1"
+              value={Math.min(delay, delayMax || 0)}
+              disabled={!delayMax}
               onChange={(e) => onDelay(c.mac, Number(e.target.value))}
             />
             <span className="pct">{delay}ms</span>
@@ -451,51 +502,60 @@
       const [clockOffset, setClockOffset] = useState(0);
       const [volumes, setVolumes] = useState({}); // mac -> 0..1, UI source of truth
       const [delays, setDelays] = useState({});   // mac -> ms, UI source of truth
+      const [sendParams, setSendParams] = useState({}); // source_id -> {lead_ms,redundancy,last_lead_ms}
       const [error, setError] = useState(null);
       const putSetting = useImmediatePut();
 
-      // Poll the client list + catalog and live telemetry together. The server
-      // keeps the full ~60s of 10Hz history, so a fast poll yields smooth graphs.
+      // Subscribe to the live stats stream (SSE). The server sends one `snapshot`
+      // with the full ~60s history, then `delta` events with only new samples,
+      // which we append into rolling per-entity buffers. `clients` meta + catalog
+      // ride along on every event so the controls stay current.
+      const hist = useRef({ server: {}, clients: {} }); // id/mac -> {meta, samples}
       useEffect(() => {
-        let alive = true;
-        const tick = async () => {
-          try {
-            const [cRes, sRes] = await Promise.all([
-              fetch("/api/clients"),
-              fetch("/api/stats"),
-            ]);
-            if (!cRes.ok) throw new Error("HTTP " + cRes.status);
-            const cj = await cRes.json();
-            const list = cj.clients || [];
-            const cat = cj.catalog || [];
-            const st = sRes.ok ? await sRes.json() : null;
-            if (!alive) return;
-            setClients(list);
-            setCatalog(cat);
-            if (st) {
-              setStats(st);
-              // Align our clock to the server's so sample timestamps land on the
-              // live right edge; graphs then advance on Date.now() between polls.
-              setClockOffset(st.now_ms - Date.now());
+        const es = new EventSource("/api/events");
+        es.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+          const h = hist.current;
+          if (msg.type === "snapshot") { h.server = {}; h.clients = {}; }
+          const roll = (bucket, key, item) => {
+            const e = (bucket[key] ||= { meta: item, samples: [] });
+            e.meta = item;
+            if (item.samples && item.samples.length) e.samples.push(...item.samples);
+            if (e.samples.length > 600) e.samples.splice(0, e.samples.length - 600);
+          };
+          for (const s of (msg.server || [])) roll(h.server, s.source_id, s);
+          for (const c of (msg.clients_hist || [])) roll(h.clients, c.mac, c);
+          // Drop entities no longer present so stale cards disappear.
+          const liveSrc = new Set((msg.server || []).map((s) => s.source_id));
+          for (const k of Object.keys(h.server)) if (!liveSrc.has(k)) delete h.server[k];
+          const liveCli = new Set((msg.clients_hist || []).map((c) => c.mac));
+          for (const k of Object.keys(h.clients)) if (!liveCli.has(k)) delete h.clients[k];
+
+          setClients(msg.clients || []);
+          setCatalog(msg.catalog || []);
+          setClockOffset(msg.now_ms - Date.now());
+          setStats({
+            now_ms: msg.now_ms,
+            server: Object.values(h.server).map((x) => ({ ...x.meta, samples: x.samples })),
+            clients: Object.values(h.clients).map((x) => ({ ...x.meta, samples: x.samples })),
+          });
+          setSendParams((prev) => {
+            const next = { ...prev };
+            for (const s of (msg.server || [])) {
+              if (!s.remote && !(s.source_id in next)) {
+                next[s.source_id] = {
+                  lead_ms: s.lead_ms, redundancy: s.redundancy,
+                  last_lead_ms: s.last_lead_ms, unicast: s.unicast,
+                };
+              }
             }
-            setError(null);
-            setVolumes((prev) => {
-              const next = { ...prev };
-              for (const c of list) if (!(c.mac in next)) next[c.mac] = c.volume;
-              return next;
-            });
-            setDelays((prev) => {
-              const next = { ...prev };
-              for (const c of list) if (!(c.mac in next)) next[c.mac] = c.delay_ms;
-              return next;
-            });
-          } catch (e) {
-            if (alive) setError("Can't reach server: " + e.message);
-          }
+            return next;
+          });
+          setError(null);
         };
-        tick();
-        const id = setInterval(tick, POLL_MS);
-        return () => { alive = false; clearInterval(id); };
+        es.onerror = () => setError("Stream interrupted; reconnecting…");
+        return () => es.close();
       }, []);
 
       // Source is a discrete pick: fire the command and let telemetry reflect it
@@ -510,40 +570,60 @@
         putSetting(mac, "delay", { delay_ms: ms });
       };
       const onName = (mac, name) => putSetting(mac, "name", { name: name || null });
+      // Send-timing edit: optimistic local state + PUT to the source endpoint.
+      const onSend = (id, patch) => {
+        setSendParams((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+        fetch(`/api/sources/${id}/send`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        }).catch(() => {});
+      };
 
       // Index telemetry by MAC so each card can find its own history.
       const statsByMac = {};
       if (stats) for (const cs of stats.clients) statsByMac[cs.mac] = cs;
       const sources = stats ? (stats.server || []) : [];
+      // Catalog lead per source id → a client's delay cap when it plays that source.
+      const leadById = {};
+      for (const s of catalog) leadById[s.source_id] = s.lead_ms;
 
       return (
         <div className="wrap">
           <header>
             <h1>RustCast</h1>
             <span className="sub">
-              {clients.length} client{clients.length === 1 ? "" : "s"} · {catalog.length} source{catalog.length === 1 ? "" : "s"} · live telemetry
+              {clients.length} client{clients.length === 1 ? "" : "s"} · {catalog.length} source{catalog.length === 1 ? "" : "s"} · live
             </span>
           </header>
           {error && <div className="err">{error}</div>}
 
-          <div className="sectitle">Streams (all servers)</div>
-          {sources.length === 0 && <div className="empty">No streams yet.</div>}
-          {sources.map((src) => (
-            <ServerSourceCard key={src.source_id} src={src} clockOffset={clockOffset} />
-          ))}
+          <div className="columns">
+            <section className="col">
+              <div className="sectitle">Streams</div>
+              {sources.length === 0 && <div className="empty">No streams yet.</div>}
+              {sources.map((src) => (
+                <ServerSourceCard key={src.source_id} src={src} sp={sendParams[src.source_id]}
+                  clockOffset={clockOffset} onSend={onSend} />
+              ))}
+            </section>
 
-          <div className="sectitle">Clients</div>
-          {clients.length === 0 && !error && (
-            <div className="empty">No clients connected yet.</div>
-          )}
-          {clients.map((c) => (
-            <Client
-              key={c.mac} c={c} st={statsByMac[c.mac]} catalog={catalog} clockOffset={clockOffset}
-              volume={volumes[c.mac] ?? c.volume}
-              delay={delays[c.mac] ?? c.delay_ms}
-              onSource={onSource} onVolume={onVolume} onDelay={onDelay} onName={onName}
-            />
-          ))}
+            <section className="col">
+              <div className="sectitle">Clients</div>
+              {clients.length === 0 && !error && (
+                <div className="empty">No clients connected yet.</div>
+              )}
+              {clients.map((c) => (
+                <Client
+                  key={c.mac} c={c} st={statsByMac[c.mac]} catalog={catalog} clockOffset={clockOffset}
+                  volume={volumes[c.mac] ?? c.volume}
+                  delay={delays[c.mac] ?? c.delay_ms}
+                  delayMax={leadById[c.selected_source_id]}
+                  onSource={onSource} onVolume={onVolume} onDelay={onDelay} onName={onName}
+                />
+              ))}
+            </section>
+          </div>
         </div>
       );
     }

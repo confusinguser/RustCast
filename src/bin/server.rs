@@ -9,21 +9,21 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::process::exit;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustcast::api::{self, ControlSender};
+use rustcast::api::{self, ControlSender, SourceControl};
 use rustcast::catalog::{
     CatalogStore, auto_group, run_catalog_announcer, run_catalog_receiver, source_id,
 };
 use rustcast::clients::{ClientStore, mac_hex};
 use rustcast::config::{Config, SourceKind};
 use rustcast::metrics::{
-    ServerMetrics, TelemetryStore, WebActivity, run_stats_broadcaster, run_stats_receiver,
-    run_telemetry_receiver, run_telemetry_requester,
+    ServerMetrics, TelemetryStore, run_stats_broadcaster, run_stats_receiver,
+    run_telemetry_receiver,
 };
-use rustcast::stream::run_source_stream;
-use rustcast::sync::run_server_responder;
+use rustcast::stream::{SendParams, run_source_stream};
+use rustcast::sync::{Listeners, run_server_responder};
 use rustcast::wire::{CatalogEntry, DEFAULT_SYNC_PORT, WireFormat, now_epoch_ms};
 
 /// Port for the HTTP control API + web UI.
@@ -38,12 +38,14 @@ const RECONCILE_MS: u64 = 500;
 /// One fully-resolved source, ready to stream.
 struct Prepared {
     id: u64,
+    cfg_index: usize,
     name: String,
     group: Ipv4Addr,
     wire_fmt: WireFormat,
     channels: u16,
     sample_rate: u32,
     kind: SourceKind,
+    params: Arc<SendParams>,
     metrics: Arc<ServerMetrics>,
 }
 
@@ -63,7 +65,7 @@ fn main() {
     // Resolve every source: id, group (explicit or auto), wire format, metrics.
     let mut prepared: Vec<Prepared> = Vec::new();
     let mut used_groups: HashSet<Ipv4Addr> = HashSet::new();
-    for s in &config.sources {
+    for (cfg_index, s) in config.sources.iter().enumerate() {
         let id = source_id(server_id, &s.name);
         let mut group = s.group.unwrap_or_else(|| auto_group(id));
         // Nudge apart any two of *our own* sources that landed on the same group.
@@ -75,39 +77,62 @@ fn main() {
         let (channels, sample_rate) = nominal_format(&s.kind);
         prepared.push(Prepared {
             id,
+            cfg_index,
             name: s.name.clone(),
             group,
             wire_fmt,
             channels,
             sample_rate,
             kind: s.kind.clone(),
+            params: Arc::new(SendParams::new(
+                s.lead_ms,
+                s.redundancy,
+                s.last_lead_ms,
+                s.unicast,
+            )),
             metrics: Arc::new(ServerMetrics::new()),
         });
     }
 
+    // Config is shared so the API can persist send-timing edits back to the yaml.
+    let config = Arc::new(Mutex::new(config));
+
     // Shared state.
     let catalog_store = Arc::new(CatalogStore::new());
     let telemetry = Arc::new(TelemetryStore::new());
-    let activity = Arc::new(WebActivity::new());
     let control = Arc::new(ControlSender::new(iface).expect("bind control socket"));
     // Durable per-client settings, keyed by MAC.
     let clients_store = Arc::new(ClientStore::load(CLIENTS_JSON));
+    // Who's listening to each source (learned from time-sync requests); gates
+    // idle sources and targets unicast mode.
+    let listeners = Arc::new(Listeners::new());
 
-    // Catalog entries we advertise.
-    let mut entries: Vec<CatalogEntry> = Vec::new();
+    // Catalog entries we advertise, each paired with its live SendParams so the
+    // announcer reports the current lead. And the UI-controllable source list.
+    let mut entries: Vec<(CatalogEntry, Arc<SendParams>)> = Vec::new();
+    let mut controls: Vec<SourceControl> = Vec::new();
     for p in &prepared {
-        entries.push(CatalogEntry {
-            source_id: p.id,
-            name: p.name.clone(),
-            source_type: p.kind.type_name().to_string(),
-            group: p.group.octets(),
-            sample_rate: p.sample_rate,
-            channels: p.channels,
-            format: p.wire_fmt,
-            lead_ms: rustcast::stream::SEND_LEAD_MS as u32,
+        entries.push((
+            CatalogEntry {
+                source_id: p.id,
+                name: p.name.clone(),
+                source_type: p.kind.type_name().to_string(),
+                group: p.group.octets(),
+                sample_rate: p.sample_rate,
+                channels: p.channels,
+                format: p.wire_fmt,
+                lead_ms: p.params.lead() as u32,
+            },
+            p.params.clone(),
+        ));
+        controls.push(SourceControl {
+            id: p.id,
+            cfg_index: p.cfg_index,
+            params: p.params.clone(),
         });
     }
     let entries = Arc::new(entries);
+    let controls = Arc::new(controls);
 
     println!(
         "RustCast server {server_id:016x}: {} source(s), UI on http://0.0.0.0:{HTTP_PORT}",
@@ -119,10 +144,22 @@ fn main() {
         let catalog = catalog_store.clone();
         let telemetry = telemetry.clone();
         let clients = clients_store.clone();
-        let activity = activity.clone();
         let control = control.clone();
+        let controls = controls.clone();
+        let config = config.clone();
+        let config_path = config_path.clone();
         std::thread::spawn(move || {
-            api::run(server_id, catalog, telemetry, clients, activity, control, HTTP_PORT)
+            api::run(
+                server_id,
+                catalog,
+                telemetry,
+                clients,
+                control,
+                controls,
+                config,
+                config_path,
+                HTTP_PORT,
+            )
         });
     }
     // Reconcile persisted settings onto clients: adopt a new client's reported
@@ -148,7 +185,10 @@ fn main() {
             }
         });
     }
-    std::thread::spawn(move || run_server_responder(DEFAULT_SYNC_PORT));
+    {
+        let listeners = listeners.clone();
+        std::thread::spawn(move || run_server_responder(DEFAULT_SYNC_PORT, listeners));
+    }
     {
         let entries = entries.clone();
         std::thread::spawn(move || {
@@ -159,14 +199,10 @@ fn main() {
         let catalog = catalog_store.clone();
         std::thread::spawn(move || run_catalog_receiver(catalog, iface));
     }
+    // Accept client telemetry over TCP (clients connect to us directly).
     {
         let telemetry = telemetry.clone();
         std::thread::spawn(move || run_telemetry_receiver(telemetry));
-    }
-    // Ping clients for telemetry (unicast) while a web user is watching.
-    {
-        let activity = activity.clone();
-        std::thread::spawn(move || run_telemetry_requester(server_id, activity, iface));
     }
     // Learn other servers' send-path stats so this UI graphs their streams too.
     {
@@ -195,10 +231,14 @@ fn main() {
     // One streaming thread per source.
     let mut handles = Vec::new();
     for p in prepared {
+        let listeners = listeners.clone();
         let handle = std::thread::Builder::new()
             .name(format!("stream-{}", p.name))
             .spawn(move || {
-                run_source_stream(p.id, p.name, p.group, p.wire_fmt, iface, p.kind, p.metrics)
+                run_source_stream(
+                    p.id, p.name, p.group, p.wire_fmt, iface, p.kind, p.params, listeners,
+                    p.metrics,
+                )
             })
             .expect("spawn source stream");
         handles.push(handle);

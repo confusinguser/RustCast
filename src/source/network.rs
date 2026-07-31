@@ -25,14 +25,13 @@ use crate::wire::AudioPacket;
 /// bound. At realtime pacing the buffer holds only ~the server's lead.
 const MAX_BUFFERED: usize = 2000;
 /// How long to wait for a missing in-order packet before treating it as lost.
-const JITTER_WAIT_MS: u64 = 30;
+const JITTER_WAIT_MS: u64 = 0;
 /// Upper bound on a single play-at sleep, so a bad clock estimate can't wedge
 /// playback for a long time.
 const MAX_SLEEP_MS: u64 = 2000;
-/// If a packet is already this many ms past its (delay-adjusted) play time, drop
-/// it rather than play it late. This advances our position so a delay increase
-/// plays earlier, and bounds output latency against clock drift.
-const LATE_DROP_MS: f64 = 8.0;
+/// Release each packet to the player this many ms *ahead* of its play time, so
+/// the player queue keeps a steady cushion and doesn't underrun on jitter.
+const CUSHION_MS: f64 = 60.0;
 /// How often the selection watcher re-checks the catalog, so a source selected
 /// before its server was heard gets joined once it appears.
 const SELECTION_POLL_MS: u64 = 500;
@@ -209,35 +208,43 @@ impl NetworkSource {
         }
     }
 
-    /// The next block of samples to play, scheduled on the synced server clock.
-    /// Blocks until each packet is due. `None` only on a dead receiver socket.
-    pub fn next_samples(&mut self) -> Option<PlayChunk> {
+    /// The next block of samples to play, released to the player a cushion ahead
+    /// of its play time on the synced server clock. Blocks until due. `None` on
+    /// a dead receiver socket or timeout.
+    pub fn next_samples_timeout(&mut self, duration: Duration) -> Option<PlayChunk> {
+        let start = std::time::Instant::now();
         loop {
+            // Don't start (or resume after a server switch) until the clock has a
+            // full warmup estimate — playing against a not-yet-settled offset
+            // would jump. The receiver keeps filling the jitter buffer meanwhile.
+            if !self.clock.is_initialized() {
+                if self.shared.closed.load(Ordering::Relaxed) {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+
             let pkt = self.pull_next()?;
 
-            // Only schedule against the absolute play-at time once the clock has
-            // a real estimate. Before the first sync sample the offset is 0, so
-            // on a client whose local clock is behind the server every packet
-            // looks far in the future — the puller would sleep while the jitter
-            // buffer fills to its cap and, if sync never lands, never recover.
-            // Until then, play arrival-paced (the server already sends at
-            // realtime), so audio flows and the buffer stays shallow.
-            if self.clock.is_initialized() {
-                let delay = self.settings.delay_ms() as f64;
-                // Target wall-clock time (on the synced server clock) to hand
-                // this packet to the device; the per-device delay pulls it earlier.
-                let target = pkt.play_at_ms as f64 - delay;
-                let ahead = target - self.clock.server_now_ms();
+            let delay = self.settings.delay_ms() as f64;
+            // When to hand this packet to the player: CUSHION_MS before its
+            // (delay-adjusted) play time, so it waits in the player queue that
+            // long — the queue holds ~CUSHION_MS and can't underrun on jitter.
+            let target = pkt.play_at_ms as f64 - delay - CUSHION_MS;
+            let ahead = target - self.clock.server_now_ms();
 
-                if ahead < -LATE_DROP_MS {
-                    // Past its play time: drop and advance. Keeps the output queue
-                    // near-empty and makes a larger delay skip the stream forward.
-                    self.metrics.record_late_drop();
-                    continue;
+            if ahead < -CUSHION_MS {
+                // Past its intended play time. Drop it rather than play late
+                self.metrics.record_late_drop();
+                continue;
+            }
+            if ahead > 0.0 {
+                let sleep_duration = Duration::from_millis((ahead as u64).min(MAX_SLEEP_MS));
+                if start.elapsed() + sleep_duration > duration {
+                    return None; // timeout reached
                 }
-                if ahead > 0.0 {
-                    thread::sleep(Duration::from_millis((ahead as u64).min(MAX_SLEEP_MS)));
-                }
+                thread::sleep(sleep_duration);
             }
 
             return Some(PlayChunk {
@@ -324,9 +331,11 @@ fn run_selection_watcher(
         match resolved {
             Some(rs) => {
                 let group = Ipv4Addr::from(rs.entry.group);
-                // Already playing this exact source: just refresh the sync target.
+                // Already playing this exact source: just refresh the sync target
+                // and the delay cap (the source's lead may have changed live).
                 if active_id == selected && joined_group == Some(group) {
                     sync_target.set(rs.server_ip, rs.sync_port);
+                    settings.set_active_lead(rs.entry.lead_ms);
                     continue;
                 }
                 // Join the new group *before* switching so we don't miss its start.
@@ -356,6 +365,7 @@ fn run_selection_watcher(
                 joined_group = Some(group);
                 active_id = selected;
                 sync_target.set(rs.server_ip, rs.sync_port);
+                settings.set_active_lead(rs.entry.lead_ms);
                 metrics.set_format(rs.entry.sample_rate, rs.entry.channels);
                 println!("playing '{}' from {}", rs.entry.name, rs.server_ip);
             }

@@ -21,31 +21,45 @@
 use std::io;
 use std::net::Ipv4Addr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::wire::WireFormat;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Optional multicast egress interface IP (`IP_MULTICAST_IF`). `None` lets
     /// the kernel choose — fine on a single-homed host.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Ipv4Addr>,
     pub sources: Vec<SourceConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     /// Human display name, shown in the UI dropdown.
     pub name: String,
     /// Explicit multicast group override; auto-derived from the source id if absent.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<Ipv4Addr>,
+    /// Send lead in ms: how far ahead of play time the first packet copy is sent
+    /// (the client's jitter-buffer depth). Adjustable live from the UI.
+    #[serde(default = "default_lead_ms")]
+    pub lead_ms: u64,
+    /// Number of identical copies of each packet to send (repetition FEC).
+    #[serde(default = "default_redundancy")]
+    pub redundancy: u32,
+    /// How long before play time the *last* copy is sent; copies are spaced
+    /// evenly between `lead_ms` (first) and this (last).
+    #[serde(default = "default_last_lead_ms")]
+    pub last_lead_ms: u64,
+    /// Stream by unicast to each listening client instead of the multicast group.
+    #[serde(default)]
+    pub unicast: bool,
     #[serde(flatten)]
     pub kind: SourceKind,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SourceKind {
     Pipe {
@@ -79,7 +93,7 @@ pub enum SourceKind {
     /// A capture device (microphone / line-in) whose audio is streamed.
     Mic {
         /// Audio-server source name to capture; the default input if omitted.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         device: Option<String>,
         #[serde(default = "default_format")]
         format: String,
@@ -153,6 +167,15 @@ impl Config {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {e}")))
     }
 
+    /// Write the config back to `path`. Used to persist send-timing changes made
+    /// from the web UI. Note: this is a serde round-trip, so any comments in the
+    /// original file are not preserved.
+    pub fn save(&self, path: &str) -> io::Result<()> {
+        let yaml = serde_norway::to_string(self)
+            .map_err(|e| io::Error::other(format!("serialize config: {e}")))?;
+        std::fs::write(path, yaml)
+    }
+
     /// Reject configs that can't be run, with a clear message (better than a
     /// panic deep inside a source thread later).
     pub fn validate(&self) -> Result<(), String> {
@@ -189,4 +212,43 @@ fn default_device_name() -> String {
 }
 fn default_sink_name() -> String {
     "RustCast".into()
+}
+fn default_lead_ms() -> u64 {
+    200
+}
+fn default_redundancy() -> u32 {
+    1
+}
+fn default_last_lead_ms() -> u64 {
+    60
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_params_and_tagged_enum_round_trip() {
+        // Defaults apply when send fields are absent.
+        let cfg = serde_norway::from_str::<Config>(
+            "sources:\n  - type: pipe\n    name: A\n    path: fifo\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sources[0].lead_ms, 200);
+        assert_eq!(cfg.sources[0].redundancy, 1);
+        assert_eq!(cfg.sources[0].last_lead_ms, 60);
+
+        // Explicit values parse, and survive a save/reload round-trip together
+        // with the flattened `type`-tagged kind.
+        let cfg = serde_norway::from_str::<Config>(
+            "sources:\n  - type: mic\n    name: Mic\n    lead_ms: 400\n    redundancy: 3\n    last_lead_ms: 100\n",
+        )
+        .unwrap();
+        let out = serde_norway::to_string(&cfg).unwrap();
+        let back = serde_norway::from_str::<Config>(&out).unwrap();
+        assert_eq!(back.sources[0].lead_ms, 400);
+        assert_eq!(back.sources[0].redundancy, 3);
+        assert_eq!(back.sources[0].last_lead_ms, 100);
+        assert_eq!(back.sources[0].kind.type_name(), "mic");
+    }
 }

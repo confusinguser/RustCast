@@ -9,13 +9,11 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::num::NonZero;
 use std::sync::Arc;
 use std::thread;
-
+use std::time::Duration;
 use rodio::SampleRate;
 use rodio::cpal::BufferSize;
 use rustcast::catalog::{CatalogStore, run_catalog_receiver};
-use rustcast::metrics::{
-    DeviceMetrics, TelemetryTargets, run_telemetry_ping_listener, run_telemetry_sender,
-};
+use rustcast::metrics::{DeviceMetrics, run_telemetry_sender};
 use rustcast::net::bind_reuse;
 use rustcast::source::network::NetworkSource;
 use rustcast::sync::{ClientSettings, SyncTarget, SyncedClock, run_client_sync};
@@ -26,11 +24,9 @@ const TELEMETRY_INTERVAL_MS: u64 = 100; // ~10 Hz
 
 // Small cpal device buffer to keep output-side latency low.
 const DEVICE_BUFFER_FRAMES: u32 = 512; // ~11ms at 44.1 kHz
-// Hard cap on the rodio output-queue depth, in appended blocks. Kept short so
-// that raising the delay skips the stream forward rather than piling audio into
-// the output queue: once the queue is this deep we drop the new block instead
-// of appending it, keeping output latency bounded.
-const MAX_QUEUED_BUFFERS: usize = 12;
+// Headroom added to the source's send lead when computing the total-buffer
+// budget, so steady-state jitter doesn't nuisance-drop.
+const BUDGET_MARGIN_MS: u32 = 3;
 
 fn main() {
     // Optional local interface IP for multicast on multi-homed hosts;
@@ -57,9 +53,6 @@ fn main() {
     let sync_target = Arc::new(SyncTarget::new());
     let clock = Arc::new(SyncedClock::new());
     let metrics = Arc::new(DeviceMetrics::new());
-    // Servers that have pinged us for telemetry; we unicast to them for a grace
-    // window after each ping.
-    let telemetry_targets = Arc::new(TelemetryTargets::new());
 
     // Learn the source catalog from every server's announcements.
     {
@@ -95,35 +88,28 @@ fn main() {
     )
     .expect("start network source");
 
-    // Time-sync against whichever server owns the selected source.
+    // Time-sync against whichever server owns the selected source. Also carries
+    // our selection to that server so it knows we're listening.
     {
         let clock = clock.clone();
         let metrics = metrics.clone();
+        let settings = settings.clone();
         thread::Builder::new()
             .name("time-sync".into())
-            .spawn(move || run_client_sync(sync_target, clock, metrics))
+            .spawn(move || run_client_sync(sync_target, clock, settings, metrics))
             .expect("spawn time-sync");
     }
 
-    // Listen for telemetry-request pings from watching servers.
-    {
-        let targets = telemetry_targets.clone();
-        thread::Builder::new()
-            .name("telemetry-ping".into())
-            .spawn(move || run_telemetry_ping_listener(targets, iface))
-            .expect("spawn telemetry ping listener");
-    }
-
-    // Unicast telemetry + settings (~10 Hz) to each server currently pinging us.
+    // Stream telemetry + settings (~10 Hz) to every server over TCP.
     {
         let settings = settings.clone();
         let metrics = metrics.clone();
         let host = host.clone();
-        let targets = telemetry_targets.clone();
+        let catalog = catalog.clone();
         thread::Builder::new()
             .name("telemetry".into())
             .spawn(move || {
-                run_telemetry_sender(settings, metrics, mac, host, targets, TELEMETRY_INTERVAL_MS)
+                run_telemetry_sender(settings, metrics, mac, host, catalog, TELEMETRY_INTERVAL_MS)
             })
             .expect("spawn telemetry");
     }
@@ -143,7 +129,11 @@ fn main() {
     // miscounted as an underrun.
     let mut started = false;
     // Runs forever: next_samples() only returns None if the receive socket dies.
-    while let Some(chunk) = source.next_samples() {
+    loop {
+        let Some(chunk) = source.next_samples_timeout(Duration::from_millis(1000)) else {
+            metrics.set_output_queue_len(player.len());
+            continue;
+        };
         if let Some(vol) = source.take_volume_update() {
             player.set_volume(vol);
         }
@@ -162,9 +152,20 @@ fn main() {
         if started && queued == 0 {
             metrics.record_underrun();
         }
-        // Drop this block if the output queue is running deep (card slower than
-        // the stream) to keep latency bounded.
-        if queued > MAX_QUEUED_BUFFERS {
+        // Combined-budget overrun: the jitter buffer and the player queue are one
+        // latency budget. Drop when their sum exceeds ~the source's send lead
+        // (+ margin), so raising the delay shifts packets between the two buffers
+        // rather than growing the total without bound.
+        let frames = chunk.samples.len() / chunk.channels.max(1) as usize;
+        let pkt_ms = if chunk.sample_rate > 0 {
+            (frames as f64 * 1000.0 / chunk.sample_rate as f64).max(1.0)
+        } else {
+            1.0
+        };
+        let budget_ms = (settings.active_lead_ms() + BUDGET_MARGIN_MS) as f64;
+        let budget_pkts = (budget_ms / pkt_ms).ceil() as usize;
+        let total = metrics.jitter_buffer_len() as usize + queued;
+        if total > budget_pkts {
             metrics.record_overrun_drop();
             continue;
         }
@@ -177,8 +178,6 @@ fn main() {
         metrics.record_append(n);
         started = true;
     }
-
-    eprintln!("Audio receive socket closed; exiting.");
 }
 
 /// Determine this host's primary IPv4 address. If an interface was given, use
