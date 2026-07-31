@@ -1,19 +1,23 @@
-//! NTP-like clock synchronization.
+//! Client clock synchronization and client-owned settings.
 //!
-//! Multicast is one-way (server → clients), so to estimate the server's clock a
-//! client opens a *unicast* side-channel to the server and does an NTP-style
+//! Multicast audio is one-way (server → clients), so to estimate the owning
+//! server's clock a client opens a *unicast* side-channel and does an NTP-style
 //! round-trip exchange. [`SyncedClock`] turns those measurements into a smooth,
-//! continuously-corrected estimate of the server's clock that playback
-//! schedules against — no external NTP daemon required.
+//! continuously-corrected estimate that playback schedules against.
+//!
+//! With many servers, no single server owns a client's settings, so the client
+//! owns them itself in [`ClientSettings`] (selected source, volume, delay). The
+//! web UI mutates them by multicasting a [`ControlCommand`]; the client applies
+//! it and reflects the new value in its telemetry. The sync exchange re-points
+//! to whichever server owns the currently-selected source via [`SyncTarget`].
 
-use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::metrics::DeviceMetrics;
-use crate::wire::{SettingsRequest, SettingsResponse, TimeRequest, TimeResponse, now_epoch_ms};
+use crate::wire::{ControlCommand, MAX_DELAY_MS, TimeRequest, TimeResponse, now_epoch_ms};
 
 /// How many recent measurements to keep when choosing the best offset.
 const SAMPLE_WINDOW: usize = 64;
@@ -25,11 +29,11 @@ const MAX_SLEW_FRACTION: f64 = 0.005;
 /// Number of quick exchanges to do before settling into the steady interval.
 const WARMUP_SAMPLES: usize = 8;
 const WARMUP_INTERVAL_MS: u64 = 150;
-/// Steady sync cadence
+/// Steady sync cadence.
 const STEADY_INTERVAL_MS: u64 = 500;
-/// Fallback poll / keepalive interval. The server pushes changes instantly, so
-/// this only recovers a missed push and refreshes the client's address.
-const SETTINGS_INTERVAL_MS: u64 = 1000;
+/// How often the sync thread wakes to re-check its target while nothing is
+/// selected (Off), so it re-points promptly once a source is chosen.
+const IDLE_POLL_MS: u64 = 200;
 
 #[derive(Clone, Copy)]
 struct Sample {
@@ -50,17 +54,11 @@ struct State {
 /// A snapshot of the clock-sync state, for telemetry.
 #[derive(Clone, Copy)]
 pub struct SyncStats {
-    /// Applied offset (server_clock - client_clock), ms; what playback uses.
     pub applied_offset_ms: f64,
-    /// Best offset estimate, ms (lowest-RTT sample in the window).
     pub target_offset_ms: f64,
-    /// Lowest RTT in the window, ms.
     pub best_rtt_ms: f64,
-    /// Raw offset from the most recent NTP exchange, ms (before lowest-RTT pick).
     pub last_offset_ms: f64,
-    /// RTT of the most recent NTP exchange, ms.
     pub last_rtt_ms: f64,
-    /// Number of samples currently held.
     pub samples: usize,
 }
 
@@ -82,6 +80,17 @@ impl SyncedClock {
         }
     }
 
+    /// Discard all samples and offsets. Called when the sync target switches to
+    /// a *different server*, whose clock offset is unrelated to the old one's.
+    pub fn reset(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.samples.clear();
+        s.target_offset_ms = 0.0;
+        s.applied_offset_ms = 0.0;
+        s.last_local_ms = now_epoch_ms() as f64;
+        s.initialized = false;
+    }
+
     /// Feed a raw round-trip measurement.
     pub fn add_sample(&self, offset_ms: f64, rtt_ms: f64) {
         let mut s = self.state.lock().unwrap();
@@ -90,9 +99,9 @@ impl SyncedClock {
             s.samples.pop_front();
         }
 
-        // Use the offset from the lowest-RTT sample in the window: it is the
-        // one least distorted by transient network/queuing delay (a standard
-        // NTP heuristic), which keeps the target stable against jitter.
+        // Use the offset from the lowest-RTT sample in the window: it is the one
+        // least distorted by transient network/queuing delay (a standard NTP
+        // heuristic), which keeps the target stable against jitter.
         if let Some(best) = s
             .samples
             .iter()
@@ -164,238 +173,160 @@ impl Default for SyncedClock {
     }
 }
 
-/// A latch holding the latest server-assigned volume, written by the sync
-/// thread and consumed by the playback loop.
-pub struct VolumeCell {
-    inner: Mutex<VolumeState>,
+/// The unicast address the client currently time-syncs against: the server that
+/// owns the selected source. Updated by the selection logic; read by the sync
+/// thread. `None` when nothing is selected.
+pub struct SyncTarget {
+    inner: Mutex<Option<(Ipv4Addr, u16)>>,
 }
 
-struct VolumeState {
-    value: f32,
-    dirty: bool,
-}
-
-impl VolumeCell {
+impl SyncTarget {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(VolumeState {
-                value: 1.0,
-                dirty: false,
+            inner: Mutex::new(None),
+        }
+    }
+    pub fn set(&self, ip: Ipv4Addr, port: u16) {
+        *self.inner.lock().unwrap() = Some((ip, port));
+    }
+    pub fn clear(&self) {
+        *self.inner.lock().unwrap() = None;
+    }
+    pub fn get(&self) -> Option<(Ipv4Addr, u16)> {
+        *self.inner.lock().unwrap()
+    }
+}
+
+impl Default for SyncTarget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Client-owned settings: the single source of truth for this client's selected
+/// source, volume, and delay. Written by the control listener (applying UI
+/// commands), read by playback, the sync re-pointer, and the telemetry sender.
+pub struct ClientSettings {
+    inner: Mutex<SettingsInner>,
+    /// Signalled when the selected source changes, so the network source's
+    /// watcher can re-join the appropriate multicast group.
+    cv: Condvar,
+}
+
+struct SettingsInner {
+    /// 0 = off (play nothing).
+    selected_source_id: u64,
+    volume: f32,
+    delay_ms: u32,
+    volume_dirty: bool,
+    /// Bumped on every actual selection change; the watcher keys off it.
+    selection_epoch: u64,
+}
+
+impl ClientSettings {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(SettingsInner {
+                selected_source_id: 0,
+                volume: 1.0,
+                delay_ms: 0,
+                volume_dirty: true, // apply the initial volume once at startup
+                selection_epoch: 0,
             }),
+            cv: Condvar::new(),
         }
     }
 
-    /// Record a new target volume; marks it dirty only if it actually changed.
-    pub fn set(&self, value: f32) {
-        let mut s = self.inner.lock().unwrap();
-        if (value - s.value).abs() > f32::EPSILON {
-            s.value = value;
-            s.dirty = true;
-        }
+    /// (selected_source_id, volume, delay_ms) for a telemetry report.
+    pub fn report_values(&self) -> (u64, f32, u32) {
+        let s = self.inner.lock().unwrap();
+        (s.selected_source_id, s.volume, s.delay_ms)
     }
 
-    /// Return the volume if it changed since the last call, clearing the flag.
-    pub fn take_update(&self) -> Option<f32> {
+    pub fn selected(&self) -> u64 {
+        self.inner.lock().unwrap().selected_source_id
+    }
+
+    pub fn delay_ms(&self) -> u32 {
+        self.inner.lock().unwrap().delay_ms
+    }
+
+    /// The current volume if it changed since the last call, clearing the flag.
+    pub fn take_volume_update(&self) -> Option<f32> {
         let mut s = self.inner.lock().unwrap();
-        if s.dirty {
-            s.dirty = false;
-            Some(s.value)
+        if s.volume_dirty {
+            s.volume_dirty = false;
+            Some(s.volume)
         } else {
             None
         }
     }
+
+    fn set_volume(&self, value: f32) {
+        let mut s = self.inner.lock().unwrap();
+        let v = value.clamp(0.0, 1.0);
+        if (v - s.volume).abs() > f32::EPSILON {
+            s.volume = v;
+            s.volume_dirty = true;
+        }
+    }
+
+    fn set_delay(&self, ms: u32) {
+        let mut s = self.inner.lock().unwrap();
+        s.delay_ms = ms.min(MAX_DELAY_MS);
+    }
+
+    /// Select a source (0 = off). Bumps the epoch and wakes the watcher only on
+    /// an actual change, so redundant re-sends of a command are idempotent.
+    pub fn set_selection(&self, id: u64) {
+        let mut s = self.inner.lock().unwrap();
+        if s.selected_source_id != id {
+            s.selected_source_id = id;
+            s.selection_epoch += 1;
+            drop(s);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Apply a control command from the UI. Each field is applied only if
+    /// present; unchanged values are no-ops (so the 3× re-send is harmless).
+    pub fn apply_command(&self, cmd: &ControlCommand) {
+        if let Some(v) = cmd.set_volume {
+            self.set_volume(v);
+        }
+        if let Some(d) = cmd.set_delay_ms {
+            self.set_delay(d);
+        }
+        if let Some(id) = cmd.set_source_id {
+            self.set_selection(id);
+        }
+    }
+
+    /// Block until the selection epoch differs from `last_epoch` or `timeout`
+    /// elapses, then return `(selected_source_id, epoch)`. The timeout lets the
+    /// watcher retry resolving a source that wasn't in the catalog yet.
+    pub fn wait_selection_change(&self, last_epoch: u64, timeout: Duration) -> (u64, u64) {
+        let mut s = self.inner.lock().unwrap();
+        if s.selection_epoch == last_epoch {
+            let (g, _) = self.cv.wait_timeout(s, timeout).unwrap();
+            s = g;
+        }
+        (s.selected_source_id, s.selection_epoch)
+    }
 }
 
-impl Default for VolumeCell {
+impl Default for ClientSettings {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// A client that has recently contacted the server for time-sync.
-struct ClientEntry {
-    last_seen: Instant,
-    volume: f32,
-    delay_ms: u32,
-    /// Address this client sends settings requests from; where we push changes.
-    settings_addr: Option<SocketAddr>,
-}
-
-/// The per-client settings returned to a client on each sync.
-#[derive(Clone, Copy)]
-pub struct ClientSettings {
-    pub volume: f32,
-    pub delay_ms: u32,
-}
-
-/// Snapshot of one client for the HTTP API.
-pub struct ClientStatus {
-    pub ip: Ipv4Addr,
-    pub seconds_ago: f64,
-    pub volume: f32,
-    pub delay_ms: u32,
-    pub connected: bool,
-}
-
-/// Server-side registry of connected clients and their assigned volumes.
-/// Populated from time-sync traffic and read/written by the HTTP API.
-pub struct ClientRegistry {
-    clients: Mutex<HashMap<Ipv4Addr, ClientEntry>>,
-    /// Socket used to push settings changes to clients (set by the server).
-    push_sock: Mutex<Option<Arc<UdpSocket>>>,
-}
-
-impl ClientRegistry {
-    /// A client is "connected" if seen within this window.
-    const CONNECTED_SECS: f64 = 5.0;
-    /// Forget clients not seen for this long, so the list doesn't grow forever.
-    const STALE_SECS: f64 = 60.0;
-    /// Max playback advance. Must stay comfortably below the server's send lead
-    /// (SEND_LEAD_MS): a client can only skip forward into audio it has already
-    /// buffered, and needs headroom left over to absorb jitter.
-    pub const MAX_DELAY_MS: u32 = 150;
-
-    pub fn new() -> Self {
-        Self {
-            clients: Mutex::new(HashMap::new()),
-            push_sock: Mutex::new(None),
-        }
-    }
-
-    /// Provide the UDP socket used to push settings changes to clients.
-    pub fn set_push_socket(&self, sock: Arc<UdpSocket>) {
-        *self.push_sock.lock().unwrap() = Some(sock);
-    }
-
-    /// Mark `ip` as seen now, creating it (defaults) if new. Returns its current
-    /// assigned settings, for the sync response.
-    pub fn touch(&self, ip: Ipv4Addr) -> ClientSettings {
-        let mut map = self.clients.lock().unwrap();
-        let entry = map.entry(ip).or_insert(ClientEntry {
-            last_seen: Instant::now(),
-            volume: 1.0,
-            delay_ms: 0,
-            settings_addr: None,
-        });
-        entry.last_seen = Instant::now();
-        ClientSettings {
-            volume: entry.volume,
-            delay_ms: entry.delay_ms,
-        }
-    }
-
-    /// Register/refresh a client from a settings request, recording the address
-    /// to push future changes to. Returns its current settings.
-    pub fn record_settings_addr(&self, ip: Ipv4Addr, addr: SocketAddr) -> ClientSettings {
-        let mut map = self.clients.lock().unwrap();
-        let entry = map.entry(ip).or_insert(ClientEntry {
-            last_seen: Instant::now(),
-            volume: 1.0,
-            delay_ms: 0,
-            settings_addr: None,
-        });
-        entry.last_seen = Instant::now();
-        entry.settings_addr = Some(addr);
-        ClientSettings {
-            volume: entry.volume,
-            delay_ms: entry.delay_ms,
-        }
-    }
-
-    /// Set a client's volume and immediately push it. No-op if unknown.
-    pub fn set_volume(&self, ip: Ipv4Addr, volume: f32) -> bool {
-        let push = {
-            let mut map = self.clients.lock().unwrap();
-            match map.get_mut(&ip) {
-                Some(entry) => {
-                    entry.volume = volume.clamp(0.0, 1.0);
-                    Some(entry.settings_addr.map(|a| (a, entry.volume, entry.delay_ms)))
-                }
-                None => None,
-            }
-        };
-        match push {
-            Some(target) => {
-                if let Some((addr, vol, delay)) = target {
-                    self.push_settings(addr, vol, delay);
-                }
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Set a client's playback advance (ms earlier than play_at) and push it.
-    /// No-op if the client isn't known.
-    pub fn set_delay(&self, ip: Ipv4Addr, delay_ms: u32) -> bool {
-        let push = {
-            let mut map = self.clients.lock().unwrap();
-            match map.get_mut(&ip) {
-                Some(entry) => {
-                    entry.delay_ms = delay_ms.min(Self::MAX_DELAY_MS);
-                    Some(entry.settings_addr.map(|a| (a, entry.volume, entry.delay_ms)))
-                }
-                None => None,
-            }
-        };
-        match push {
-            Some(target) => {
-                if let Some((addr, vol, delay)) = target {
-                    self.push_settings(addr, vol, delay);
-                }
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Push a client's current settings to its last-known address, so a change
-    /// reaches the device at once instead of waiting for its next poll.
-    fn push_settings(&self, addr: SocketAddr, volume: f32, delay_ms: u32) {
-        let sock = self.push_sock.lock().unwrap().clone();
-        if let Some(sock) = sock {
-            let resp = SettingsResponse { nonce: 0, volume, delay_ms };
-            if let Ok(bytes) = bincode::serialize(&resp) {
-                let _ = sock.send_to(&bytes, addr);
-            }
-        }
-    }
-
-    /// Current clients, dropping any that have gone stale.
-    pub fn snapshot(&self) -> Vec<ClientStatus> {
-        let mut map = self.clients.lock().unwrap();
-        let now = Instant::now();
-        map.retain(|_, e| now.duration_since(e.last_seen).as_secs_f64() < Self::STALE_SECS);
-        let mut out: Vec<ClientStatus> = map
-            .iter()
-            .map(|(ip, e)| {
-                let secs = now.duration_since(e.last_seen).as_secs_f64();
-                ClientStatus {
-                    ip: *ip,
-                    seconds_ago: secs,
-                    volume: e.volume,
-                    delay_ms: e.delay_ms,
-                    connected: secs < Self::CONNECTED_SECS,
-                }
-            })
-            .collect();
-        out.sort_by_key(|c| c.ip.octets());
-        out
-    }
-}
-
-impl Default for ClientRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Client side: repeatedly exchange timestamps with the server and feed the
-/// results into `clock`, applying any volume the server sends back to `volume`.
-/// Runs forever; intended to live on its own thread.
+/// Client side: repeatedly exchange timestamps with the server that owns the
+/// currently-selected source (from `target`) and feed the results into `clock`.
+/// When the target server changes, the clock is reset (offsets are per-server).
+/// Runs forever; intended for its own thread.
 pub fn run_client_sync(
-    server_ip: Ipv4Addr,
-    sync_port: u16,
+    target: Arc<SyncTarget>,
     clock: Arc<SyncedClock>,
     metrics: Arc<DeviceMetrics>,
 ) {
@@ -407,12 +338,27 @@ pub fn run_client_sync(
         }
     };
     let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
-    let dest = (server_ip, sync_port);
 
     let mut nonce: u64 = 0;
     let mut buf = [0u8; 256];
+    let mut current_ip: Option<Ipv4Addr> = None;
 
     loop {
+        let dest = match target.get() {
+            Some(d) => d,
+            None => {
+                // Nothing selected: idle (keep the last clock; playback is off).
+                current_ip = None;
+                std::thread::sleep(Duration::from_millis(IDLE_POLL_MS));
+                continue;
+            }
+        };
+        // Switched to a different server: its clock offset is unrelated.
+        if current_ip != Some(dest.0) {
+            clock.reset();
+            current_ip = Some(dest.0);
+        }
+
         nonce = nonce.wrapping_add(1);
         let t1 = now_epoch_ms();
         let req = TimeRequest {
@@ -454,10 +400,10 @@ pub fn run_client_sync(
     }
 }
 
-/// Server side: answer time-sync requests with the current server clock, and
-/// register the requesting client / return its assigned volume. Runs forever;
-/// intended to live on its own thread.
-pub fn run_server_responder(sync_port: u16, registry: Arc<ClientRegistry>) {
+/// Server side: answer time-sync requests with the current server clock. Runs
+/// forever, unconditionally (a client can't start playing without it), on its
+/// own thread.
+pub fn run_server_responder(sync_port: u16) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, sync_port)) {
         Ok(s) => s,
         Err(e) => {
@@ -470,10 +416,6 @@ pub fn run_server_responder(sync_port: u16, registry: Arc<ClientRegistry>) {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 if let Ok(req) = bincode::deserialize::<TimeRequest>(&buf[..n]) {
-                    // Register the client (by IP) for liveness / the web UI list.
-                    if let std::net::SocketAddr::V4(v4) = from {
-                        registry.touch(*v4.ip());
-                    }
                     let resp = TimeResponse {
                         client_send_ms: req.client_send_ms,
                         server_ms: now_epoch_ms(),
@@ -486,81 +428,6 @@ pub fn run_server_responder(sync_port: u16, registry: Arc<ClientRegistry>) {
             }
             Err(e) => {
                 eprintln!("time-sync responder: recv error: {e}");
-                return;
-            }
-        }
-    }
-}
-
-/// Client side: periodically ask the server for this client's settings
-/// (volume + delay) on the dedicated settings port and apply them. Kept
-/// separate from the time-sync exchange. Runs forever; intended for a thread.
-pub fn run_settings_client(
-    server_ip: Ipv4Addr,
-    settings_port: u16,
-    volume: Arc<VolumeCell>,
-    delay_ms: Arc<AtomicU32>,
-) {
-    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("settings: could not bind socket: {e}");
-            return;
-        }
-    };
-    // Block up to the fallback interval per recv; a server push wakes us at once.
-    let _ = sock.set_read_timeout(Some(Duration::from_millis(SETTINGS_INTERVAL_MS)));
-    let dest = (server_ip, settings_port);
-    let mut buf = [0u8; 256];
-    loop {
-        // Fallback poll / keepalive: lets the server learn our address (so it
-        // can push) and recovers any missed push.
-        let req = SettingsRequest { nonce: 0 };
-        if let Ok(bytes) = bincode::serialize(&req) {
-            let _ = sock.send_to(&bytes, dest);
-        }
-        // Apply every settings message the instant it lands (server pushes and
-        // the poll reply), until the socket is quiet for the interval.
-        loop {
-            match sock.recv_from(&mut buf) {
-                Ok((n, _)) => {
-                    if let Ok(resp) = bincode::deserialize::<SettingsResponse>(&buf[..n]) {
-                        volume.set(resp.volume);
-                        delay_ms.store(resp.delay_ms, Ordering::Relaxed);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-}
-
-/// Server side: answer settings requests, recording each client's address so
-/// changes can be pushed to it, and reply with its current settings. Runs
-/// forever; intended for its own thread. `sock` is the shared settings socket.
-pub fn run_settings_responder(sock: Arc<UdpSocket>, registry: Arc<ClientRegistry>) {
-    let mut buf = [0u8; 256];
-    loop {
-        match sock.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if bincode::deserialize::<SettingsRequest>(&buf[..n]).is_ok() {
-                    let settings = if let std::net::SocketAddr::V4(v4) = from {
-                        registry.record_settings_addr(*v4.ip(), from)
-                    } else {
-                        ClientSettings { volume: 1.0, delay_ms: 0 }
-                    };
-                    let resp = SettingsResponse {
-                        nonce: 0,
-                        volume: settings.volume,
-                        delay_ms: settings.delay_ms,
-                    };
-                    if let Ok(bytes) = bincode::serialize(&resp) {
-                        let _ = sock.send_to(&bytes, from);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("settings responder: recv error: {e}");
                 return;
             }
         }

@@ -1,26 +1,25 @@
-//! Client-side source: receives multicast [`AudioPacket`]s into a
-//! sequence-ordered jitter buffer and plays them out aligned to each packet's
-//! absolute `play_at` timestamp, measured against a [`SyncedClock`] estimate of
-//! the server's clock.
+//! Client-side playback source: receives multicast [`AudioPacket`]s for the
+//! currently-selected source into a sequence-ordered jitter buffer and plays
+//! them out aligned to each packet's absolute `play_at` timestamp, measured
+//! against a [`SyncedClock`] estimate of the owning server's clock.
 //!
-//! Three threads cooperate: a receiver fills the buffer and learns the server's
-//! address; a time-sync thread keeps the clock estimate current; and the
-//! calling thread runs `next_samples()`, which pulls packets in order and
-//! sleeps until each one's play-at time on the synced clock.
+//! The client owns its selection (in [`ClientSettings`]); a *watcher* thread
+//! reacts to selection changes and to the catalog, joining/leaving the right
+//! multicast group and re-pointing the clock sync at the owning server. There is
+//! no "server offline" concept: if nothing is selected, or the selected source
+//! is silent, playback simply produces nothing and waits.
 
 use std::collections::BTreeMap;
-use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::catalog::CatalogStore;
 use crate::metrics::DeviceMetrics;
-use crate::sync::{SyncedClock, VolumeCell, run_client_sync, run_settings_client};
-use crate::wire::{AudioPacket, DEFAULT_SETTINGS_PORT, DEFAULT_SYNC_PORT, now_epoch_ms};
-
-use super::Format;
+use crate::sync::{ClientSettings, SyncTarget, SyncedClock};
+use crate::wire::AudioPacket;
 
 /// Cap on buffered packets, so a stalled consumer can't grow memory without
 /// bound. At realtime pacing the buffer holds only ~the server's lead.
@@ -30,309 +29,356 @@ const JITTER_WAIT_MS: u64 = 30;
 /// Upper bound on a single play-at sleep, so a bad clock estimate can't wedge
 /// playback for a long time.
 const MAX_SLEEP_MS: u64 = 2000;
-/// How long `new()` waits for the first clock estimate before starting anyway
-/// (falling back to a zero offset, i.e. assuming already-synced clocks).
-const SYNC_WARMUP_TIMEOUT_MS: u64 = 1500;
-/// If a packet is already this many ms past its (delay-adjusted) play time, we
-/// drop it rather than play it late. This is what advances our stream position
-/// so a delay increase actually plays earlier, and it bounds output latency
-/// against clock drift. A hair above one packet, so steady-state pacing (which
-/// never runs late) doesn't nuisance-drop.
+/// If a packet is already this many ms past its (delay-adjusted) play time, drop
+/// it rather than play it late. This advances our position so a delay increase
+/// plays earlier, and bounds output latency against clock drift.
 const LATE_DROP_MS: f64 = 8.0;
-/// If no packet arrives for this long, treat the server as offline: playback
-/// stops (next_samples returns None) so the caller can wait for a new server.
-const SERVER_TIMEOUT_MS: u64 = 5000;
-/// How often to re-check for the server going silent while the buffer is empty.
-const SERVER_POLL_MS: u64 = 250;
+/// How often the selection watcher re-checks the catalog, so a source selected
+/// before its server was heard gets joined once it appears.
+const SELECTION_POLL_MS: u64 = 500;
+
+/// A block of decoded samples plus the format they're in — sources can differ,
+/// so the format travels with each block (the mixer resamples to the device).
+pub struct PlayChunk {
+    pub samples: Vec<f32>,
+    pub channels: u16,
+    pub sample_rate: u32,
+}
+
+struct BufState {
+    packets: BTreeMap<u64, AudioPacket>,
+    /// Next sequence number we expect to play (for the active source).
+    next_seq: u64,
+    /// After a source switch, adopt the earliest buffered seq on the next pull.
+    need_resync: bool,
+}
 
 struct Shared {
-    buf: Mutex<BTreeMap<u64, AudioPacket>>,
+    buf: Mutex<BufState>,
     cv: Condvar,
     closed: AtomicBool,
-    /// Source address of the multicast stream, learned from the first datagram.
-    /// A standalone `Arc` so the telemetry sender can address the server after
-    /// the source itself has been moved into the playback loop.
-    server_ip: Arc<Mutex<Option<Ipv4Addr>>>,
-    /// Wall-clock (epoch ms) of the most recent received packet, for detecting
-    /// that the server has gone silent.
-    last_packet_ms: AtomicU64,
+    /// Source id whose packets we currently accept; 0 = none. Read lock-free by
+    /// the receiver to filter, set by the selection watcher.
+    active_source_id: AtomicU64,
 }
 
 pub struct NetworkSource {
     shared: Arc<Shared>,
     clock: Arc<SyncedClock>,
-    volume: Arc<VolumeCell>,
-    /// Playback advance in ms: each packet is played this much earlier than its
-    /// `play_at`, to compensate for this device's speaker latency.
-    delay_ms: Arc<AtomicU32>,
-    /// Live buffer/sample metrics for this device, shared with the playback loop.
+    settings: Arc<ClientSettings>,
     metrics: Arc<DeviceMetrics>,
-    format: Format,
-    /// Next sequence number we expect to play.
-    next_seq: u64,
     _receiver: thread::JoinHandle<()>,
-    _sync: Option<thread::JoinHandle<()>>,
+    _watcher: thread::JoinHandle<()>,
 }
 
 impl NetworkSource {
-    /// Start receiving on `socket` (already bound and joined to the group).
-    /// Blocks until the first packet arrives (to learn the stream format) and,
-    /// briefly, until an initial clock estimate is available.
-    pub fn new(socket: UdpSocket, metrics: Arc<DeviceMetrics>) -> io::Result<Self> {
+    /// Start receiving on `socket` (bound to the audio port, not yet joined to
+    /// any group). Spawns the receiver and the selection watcher; returns at
+    /// once (nothing plays until a source is selected).
+    pub fn new(
+        socket: UdpSocket,
+        settings: Arc<ClientSettings>,
+        catalog: Arc<CatalogStore>,
+        sync_target: Arc<SyncTarget>,
+        clock: Arc<SyncedClock>,
+        metrics: Arc<DeviceMetrics>,
+        iface: Ipv4Addr,
+    ) -> std::io::Result<Self> {
+        let socket = Arc::new(socket);
         let shared = Arc::new(Shared {
-            buf: Mutex::new(BTreeMap::new()),
+            buf: Mutex::new(BufState {
+                packets: BTreeMap::new(),
+                next_seq: 0,
+                need_resync: true,
+            }),
             cv: Condvar::new(),
             closed: AtomicBool::new(false),
-            server_ip: Arc::new(Mutex::new(None)),
-            last_packet_ms: AtomicU64::new(now_epoch_ms()),
+            active_source_id: AtomicU64::new(0),
         });
-        let clock = Arc::new(SyncedClock::new());
-        let volume = Arc::new(VolumeCell::new());
-        let delay_ms = Arc::new(AtomicU32::new(0));
 
         let receiver = {
             let shared = shared.clone();
             let metrics = metrics.clone();
+            let socket = socket.clone();
             thread::Builder::new()
                 .name("net-recv".into())
                 .spawn(move || recv_loop(socket, shared, metrics))?
         };
 
-        // Wait for the first packet so we can report the stream's format.
-        let first = {
-            let mut buf = shared.buf.lock().unwrap();
-            loop {
-                if let Some((_, pkt)) = buf.iter().next() {
-                    break pkt.clone();
-                }
-                if shared.closed.load(Ordering::Relaxed) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "receiver closed before any packet arrived",
-                    ));
-                }
-                buf = shared.cv.wait(buf).unwrap();
-            }
-        };
-
-        // Start the time-sync and settings threads now that we know the server.
-        let server_ip = *shared.server_ip.lock().unwrap();
-        let sync = server_ip.map(|ip| {
-            let clock = clock.clone();
+        let watcher = {
+            let shared = shared.clone();
+            let settings = settings.clone();
             let metrics = metrics.clone();
+            let clock = clock.clone();
             thread::Builder::new()
-                .name("time-sync".into())
-                .spawn(move || run_client_sync(ip, DEFAULT_SYNC_PORT, clock, metrics))
-                .expect("spawn time-sync thread")
-        });
-        // Volume + delay arrive on their own channel, separate from time-sync.
-        if let Some(ip) = server_ip {
-            let volume = volume.clone();
-            let delay_ms = delay_ms.clone();
-            thread::Builder::new()
-                .name("settings".into())
-                .spawn(move || run_settings_client(ip, DEFAULT_SETTINGS_PORT, volume, delay_ms))
-                .expect("spawn settings thread");
-        }
-        if server_ip.is_none() {
-            eprintln!("warning: could not determine server address; playing without clock sync");
-        }
-
-        // Give the sync a moment to converge before playback leans on it.
-        let deadline = Instant::now() + Duration::from_millis(SYNC_WARMUP_TIMEOUT_MS);
-        while !clock.is_initialized() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        metrics.set_format(first.sample_rate, first.channels);
+                .name("net-select".into())
+                .spawn(move || {
+                    run_selection_watcher(
+                        shared,
+                        socket,
+                        settings,
+                        catalog,
+                        sync_target,
+                        clock,
+                        metrics,
+                        iface,
+                    )
+                })?
+        };
 
         Ok(Self {
             shared,
             clock,
-            volume,
-            delay_ms,
+            settings,
             metrics,
-            format: Format {
-                channels: first.channels,
-                sample_rate: first.sample_rate,
-            },
-            next_seq: first.seq,
             _receiver: receiver,
-            _sync: sync,
+            _watcher: watcher,
         })
     }
 
-    /// A handle to the learned server address, for the telemetry sender. The
-    /// value is `None` until the first datagram arrives.
-    pub fn server_ip_handle(&self) -> Arc<Mutex<Option<Ipv4Addr>>> {
-        self.shared.server_ip.clone()
+    /// A pending volume change from a control command, if any.
+    pub fn take_volume_update(&self) -> Option<f32> {
+        self.settings.take_volume_update()
     }
 
-    /// Pull the next in-order packet, skipping ones detected as lost. Blocks
-    /// while the buffer is empty. Returns `None` only if the receiver closed
-    /// and the buffer is drained.
+    /// Pull the next in-order packet for the active source, skipping ones lost.
+    /// Blocks while there's nothing to play. Returns `None` only if the receiver
+    /// socket died.
     fn pull_next(&mut self) -> Option<AudioPacket> {
-        let mut buf = self.shared.buf.lock().unwrap();
+        let mut bs = self.shared.buf.lock().unwrap();
         loop {
-            // Discard anything older than what we're waiting for (late arrivals
-            // for packets we've already played or skipped).
-            while let Some(&k) = buf.keys().next() {
-                if k < self.next_seq {
-                    buf.remove(&k);
+            if self.shared.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            // Nothing selected (or Off): wait for a selection / packets.
+            if self.shared.active_source_id.load(Ordering::Relaxed) == 0 {
+                bs = self.shared.cv.wait(bs).unwrap();
+                continue;
+            }
+
+            // Just switched sources: adopt the earliest buffered seq.
+            if bs.need_resync {
+                if let Some((&seq, _)) = bs.packets.iter().next() {
+                    bs.next_seq = seq;
+                    bs.need_resync = false;
+                } else {
+                    bs = self.shared.cv.wait(bs).unwrap();
+                    continue;
+                }
+            }
+
+            // Discard anything older than what we're waiting for.
+            while let Some(&k) = bs.packets.keys().next() {
+                if k < bs.next_seq {
+                    bs.packets.remove(&k);
                 } else {
                     break;
                 }
             }
 
-            if let Some(pkt) = buf.remove(&self.next_seq) {
-                self.next_seq += 1;
-                self.metrics.set_jitter_buffer_len(buf.len());
+            let want = bs.next_seq;
+            if let Some(pkt) = bs.packets.remove(&want) {
+                bs.next_seq = want + 1;
+                self.metrics.set_jitter_buffer_len(bs.packets.len());
                 return Some(pkt);
             }
 
-            match buf.keys().next().copied() {
-                // A later packet is here but the one we want isn't: give it a
-                // short window (jitter), then declare it lost and jump ahead.
+            match bs.packets.keys().next().copied() {
+                // A later packet is here but ours isn't: give it a jitter window,
+                // then declare it lost and jump ahead.
                 Some(_) => {
                     let (guard, res) = self
                         .shared
                         .cv
-                        .wait_timeout(buf, Duration::from_millis(JITTER_WAIT_MS))
+                        .wait_timeout(bs, Duration::from_millis(JITTER_WAIT_MS))
                         .unwrap();
-                    buf = guard;
-                    if res.timed_out() && !buf.contains_key(&self.next_seq) {
-                        if let Some(&next_present) = buf.keys().next() {
-                            // Every seq we skip over is a packet that never
-                            // arrived in time - count them as lost.
-                            self.metrics.record_lost(next_present - self.next_seq);
-                            self.next_seq = next_present;
+                    bs = guard;
+                    if res.timed_out() && !bs.packets.contains_key(&bs.next_seq) {
+                        if let Some(&next_present) = bs.packets.keys().next() {
+                            self.metrics.record_lost(next_present - bs.next_seq);
+                            bs.next_seq = next_present;
                         }
                     }
                 }
-                // Buffer empty: wait for more, unless the stream has ended or
-                // the server has gone silent for SERVER_TIMEOUT_MS.
+                // Buffer empty: wait. Silence is normal (source paused / off); we
+                // never treat it as an error or "offline".
                 None => {
-                    if self.shared.closed.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    let idle_ms = now_epoch_ms()
-                        .saturating_sub(self.shared.last_packet_ms.load(Ordering::Relaxed));
-                    if idle_ms > SERVER_TIMEOUT_MS {
-                        // Nothing from the server for a while: report end-of-stream
-                        // so the caller can wait for a new server.
-                        return None;
-                    }
-                    let (guard, _) = self
-                        .shared
-                        .cv
-                        .wait_timeout(buf, Duration::from_millis(SERVER_POLL_MS))
-                        .unwrap();
-                    buf = guard;
+                    bs = self.shared.cv.wait(bs).unwrap();
                 }
             }
         }
     }
-}
 
-impl NetworkSource {
-    /// After the server has gone silent, block until a new stream appears and
-    /// resync to it: drop any stale buffered packets and adopt the sequence
-    /// number of the first packet from the (possibly new) server.
-    pub fn wait_for_new_server(&mut self) {
-        let mut buf = self.shared.buf.lock().unwrap();
-        buf.clear();
-        loop {
-            if let Some((&seq, _)) = buf.iter().next() {
-                self.next_seq = seq;
-                self.metrics.set_jitter_buffer_len(buf.len());
-                return;
-            }
-            if self.shared.closed.load(Ordering::Relaxed) {
-                return;
-            }
-            buf = self.shared.cv.wait(buf).unwrap();
-        }
-    }
-
-    pub fn format(&self) -> Format {
-        self.format
-    }
-
-    /// A pending server-assigned volume change (linear gain), if any.
-    pub fn take_volume_update(&mut self) -> Option<f32> {
-        self.volume.take_update()
-    }
-
-    /// The next block of samples to play, or `None` once the stream ends.
-    /// Blocks until each packet is due on the synced server clock.
-    pub fn next_samples(&mut self) -> Option<Vec<f32>> {
-        let delay = self.delay_ms.load(Ordering::Relaxed) as f64;
+    /// The next block of samples to play, scheduled on the synced server clock.
+    /// Blocks until each packet is due. `None` only on a dead receiver socket.
+    pub fn next_samples(&mut self) -> Option<PlayChunk> {
         loop {
             let pkt = self.pull_next()?;
 
-            // Target wall-clock time (on the synced server clock) to hand this
-            // packet to the device. The per-device delay pulls it earlier to
-            // compensate for local speaker latency.
-            let target = pkt.play_at_ms as f64 - delay;
-            let ahead = target - self.clock.server_now_ms();
+            // Only schedule against the absolute play-at time once the clock has
+            // a real estimate. Before the first sync sample the offset is 0, so
+            // on a client whose local clock is behind the server every packet
+            // looks far in the future — the puller would sleep while the jitter
+            // buffer fills to its cap and, if sync never lands, never recover.
+            // Until then, play arrival-paced (the server already sends at
+            // realtime), so audio flows and the buffer stays shallow.
+            if self.clock.is_initialized() {
+                let delay = self.settings.delay_ms() as f64;
+                // Target wall-clock time (on the synced server clock) to hand
+                // this packet to the device; the per-device delay pulls it earlier.
+                let target = pkt.play_at_ms as f64 - delay;
+                let ahead = target - self.clock.server_now_ms();
 
-            if ahead < -LATE_DROP_MS {
-                // Already past its play time: drop it and advance to the next
-                // packet. This keeps the output queue near-empty (so append
-                // time ≈ output time) and is what makes a larger delay actually
-                // skip the stream forward and play earlier.
-                self.metrics.record_late_drop();
-                continue;
+                if ahead < -LATE_DROP_MS {
+                    // Past its play time: drop and advance. Keeps the output queue
+                    // near-empty and makes a larger delay skip the stream forward.
+                    self.metrics.record_late_drop();
+                    continue;
+                }
+                if ahead > 0.0 {
+                    thread::sleep(Duration::from_millis((ahead as u64).min(MAX_SLEEP_MS)));
+                }
             }
 
-            if ahead > 0.0 {
-                // Early: wait until it's due. Waiting past what's buffered lets
-                // the queue drain (brief silence) — which is how a *smaller*
-                // delay plays later.
-                thread::sleep(Duration::from_millis((ahead as u64).min(MAX_SLEEP_MS)));
-            }
-
-            return Some(pkt.format.decode(&pkt.data));
+            return Some(PlayChunk {
+                samples: pkt.format.decode(&pkt.data),
+                channels: pkt.channels,
+                sample_rate: pkt.sample_rate,
+            });
         }
     }
 }
 
-fn recv_loop(socket: UdpSocket, shared: Arc<Shared>, metrics: Arc<DeviceMetrics>) {
-    // Max IPv4 UDP payload; our packets are far smaller but this is safe.
+fn recv_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>, metrics: Arc<DeviceMetrics>) {
     let mut buf = [0u8; 65536];
     loop {
         match socket.recv_from(&mut buf) {
-            Ok((n, addr)) => {
+            Ok((n, _addr)) => {
+                let active = shared.active_source_id.load(Ordering::Relaxed);
+                if active == 0 {
+                    continue; // nothing selected: ignore all audio
+                }
                 if let Ok(pkt) = bincode::deserialize::<AudioPacket>(&buf[..n]) {
+                    // Reject packets from a source we aren't currently playing
+                    // (e.g. lingering datagrams from a group we just left).
+                    if pkt.source_id != active {
+                        continue;
+                    }
                     metrics.record_packet_received();
-                    shared
-                        .last_packet_ms
-                        .store(now_epoch_ms(), Ordering::Relaxed);
-                    // Learn the server's address from the first datagram.
-                    if let SocketAddr::V4(v4) = addr {
-                        let mut ip = shared.server_ip.lock().unwrap();
-                        if ip.is_none() {
-                            *ip = Some(*v4.ip());
+                    let mut bs = shared.buf.lock().unwrap();
+                    bs.packets.insert(pkt.seq, pkt);
+                    while bs.packets.len() > MAX_BUFFERED {
+                        if let Some(&oldest) = bs.packets.keys().next() {
+                            bs.packets.remove(&oldest);
                         }
                     }
-
-                    let mut map = shared.buf.lock().unwrap();
-                    map.insert(pkt.seq, pkt);
-                    while map.len() > MAX_BUFFERED {
-                        if let Some(&oldest) = map.keys().next() {
-                            map.remove(&oldest);
-                        }
-                    }
-                    metrics.set_jitter_buffer_len(map.len());
+                    metrics.set_jitter_buffer_len(bs.packets.len());
                     shared.cv.notify_one();
                 }
-                // Malformed datagram: ignore and keep listening.
             }
             Err(e) => {
                 eprintln!("network receive error: {e}");
                 shared.closed.store(true, Ordering::Relaxed);
                 shared.cv.notify_all();
                 return;
+            }
+        }
+    }
+}
+
+/// Reacts to selection changes (and to the catalog catching up): joins the
+/// selected source's multicast group, resets the jitter buffer, re-points the
+/// clock sync at the owning server, and leaves the old group. Runs forever.
+#[allow(clippy::too_many_arguments)]
+fn run_selection_watcher(
+    shared: Arc<Shared>,
+    socket: Arc<UdpSocket>,
+    settings: Arc<ClientSettings>,
+    catalog: Arc<CatalogStore>,
+    sync_target: Arc<SyncTarget>,
+    clock: Arc<SyncedClock>,
+    metrics: Arc<DeviceMetrics>,
+    iface: Ipv4Addr,
+) {
+    let mut epoch: u64 = 0;
+    let mut joined_group: Option<Ipv4Addr> = None;
+    let mut active_id: u64 = 0;
+    // The server whose clock the current selection is timed against. When it
+    // changes, the clock offset is unrelated, so reset immediately (rather than
+    // waiting for the sync thread to notice) to avoid a stale-offset pile-up.
+    let mut active_server: Option<Ipv4Addr> = None;
+
+    loop {
+        // Wake on a selection change, or periodically to retry resolution of a
+        // source whose server hadn't been heard from yet.
+        let (selected, new_epoch) =
+            settings.wait_selection_change(epoch, Duration::from_millis(SELECTION_POLL_MS));
+        epoch = new_epoch;
+
+        let resolved = if selected == 0 {
+            None
+        } else {
+            catalog.resolve(selected)
+        };
+
+        match resolved {
+            Some(rs) => {
+                let group = Ipv4Addr::from(rs.entry.group);
+                // Already playing this exact source: just refresh the sync target.
+                if active_id == selected && joined_group == Some(group) {
+                    sync_target.set(rs.server_ip, rs.sync_port);
+                    continue;
+                }
+                // Join the new group *before* switching so we don't miss its start.
+                if joined_group != Some(group) {
+                    let _ = socket.join_multicast_v4(&group, &iface);
+                }
+                // Switching to a different server: its clock offset differs, so
+                // drop the old estimate now (playback plays arrival-paced until
+                // the first sample for the new server arrives).
+                if active_server != Some(rs.server_ip) {
+                    clock.reset();
+                    active_server = Some(rs.server_ip);
+                }
+                shared.active_source_id.store(selected, Ordering::Relaxed);
+                {
+                    let mut bs = shared.buf.lock().unwrap();
+                    bs.packets.clear();
+                    bs.need_resync = true;
+                    metrics.set_jitter_buffer_len(0);
+                }
+                shared.cv.notify_all();
+                if let Some(old) = joined_group {
+                    if old != group {
+                        let _ = socket.leave_multicast_v4(&old, &iface);
+                    }
+                }
+                joined_group = Some(group);
+                active_id = selected;
+                sync_target.set(rs.server_ip, rs.sync_port);
+                metrics.set_format(rs.entry.sample_rate, rs.entry.channels);
+                println!("playing '{}' from {}", rs.entry.name, rs.server_ip);
+            }
+            None => {
+                // Off, or the selected id isn't in the catalog (yet). Go silent.
+                // If still selecting an unresolved id, the poll retries resolution.
+                if active_id != 0 || joined_group.is_some() {
+                    shared.active_source_id.store(0, Ordering::Relaxed);
+                    {
+                        let mut bs = shared.buf.lock().unwrap();
+                        bs.packets.clear();
+                        bs.need_resync = true;
+                        metrics.set_jitter_buffer_len(0);
+                    }
+                    shared.cv.notify_all();
+                    if let Some(old) = joined_group {
+                        let _ = socket.leave_multicast_v4(&old, &iface);
+                    }
+                    joined_group = None;
+                    active_id = 0;
+                    active_server = None;
+                    sync_target.clear();
+                }
             }
         }
     }

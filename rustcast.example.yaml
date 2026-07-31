@@ -1,0 +1,25 @@
+# Example RustCast server config. Copy to `rustcast.yaml` (the default the server
+# looks for) or pass a path: `server my-config.yaml`.
+#
+# A server hosts any number of sources; each streams on its own auto-assigned
+# multicast group and appears in the web UI's per-client source dropdown.
+
+# Optional multicast egress interface IP (IP_MULTICAST_IF). Omit on a
+# single-homed host; set it on machines with several NICs (Wi-Fi + VPN, etc.).
+# interface: 192.168.1.10
+
+sources:
+  # A FIFO carrying raw PCM (e.g. an MPD/PipeWire pipe sink writing to it).
+  - type: pipe
+    name: "Living Room"        # shown in the UI dropdown
+    path: testfifo             # FIFO path (relative to the server's working dir)
+    format: s16                # wire format: s16 | f32
+    channels: 2
+    sample_rate: 44100
+    # group: 239.255.130.7     # optional explicit group; auto-derived otherwise
+
+  # A Spotify Connect receiver (advertises over Zeroconf as `device_name`).
+  - type: spotify
+    name: "Spotify"
+    device_name: "RustCast"
+    format: f32

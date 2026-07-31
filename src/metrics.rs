@@ -1,27 +1,45 @@
 //! Live telemetry. Client devices measure their own buffers and sample flow into
-//! lock-free [`DeviceMetrics`] and push periodic [`TelemetryReport`]s to the
-//! server; the server records its own send path in [`ServerMetrics`] and keeps a
-//! short per-source history in a [`TelemetryStore`] that the web UI graphs.
+//! lock-free [`DeviceMetrics`] and multicast periodic [`TelemetryReport`]s to
+//! every server; each server records its per-source send path in [`ServerMetrics`]
+//! and keeps a short history in a [`TelemetryStore`] that the web UI graphs.
 //!
 //! Counters are cumulative since process start; gauges are the instantaneous
 //! value at snapshot time. Recording is always lock-free so it never stalls the
 //! audio threads.
+//!
+//! Source ids are 64-bit and are serialized to JSON as *strings*, because they
+//! exceed JavaScript's safe-integer range (2^53).
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::wire::{TelemetryReport, now_epoch_ms};
+use crate::net::{bind_reuse, set_multicast_if};
+use crate::sync::ClientSettings;
+use crate::wire::{
+    STATS_GROUP, STATS_PORT, SourceStat, StatsBroadcast, TELEMETRY_PORT, TELEMETRY_REQ_GROUP,
+    TELEMETRY_REQ_PORT, TelemetryReport, TelemetryRequest, now_epoch_ms,
+};
 
 /// Retained history per source: ~60 s at the client's 10 Hz report rate.
 const HISTORY_LEN: usize = 600;
-/// Forget a client's history if it stops reporting for this long (matches the
-/// client-registry staleness window).
+/// Forget a client's history if it stops reporting for this long.
 const STALE_SECS: f64 = 60.0;
+/// A client is "connected" if a report arrived within this window.
+const CONNECTED_SECS: f64 = 5.0;
+/// A web user is "present" if the UI polled within this window; the server only
+/// requests telemetry from clients while that's true.
+const ACTIVE_WINDOW_MS: u64 = 5000;
+/// How often the server pings clients for telemetry while a user is watching.
+const TELEMETRY_PING_MS: u64 = 1000;
+/// A client keeps unicasting telemetry to a server for this long after the last
+/// ping from it (a few ping intervals, so an occasional dropped ping is fine).
+const TELEMETRY_GRACE_MS: u64 = 3000;
 
 // ---------------------------------------------------------------------------
 // Client side
@@ -56,8 +74,8 @@ impl DeviceMetrics {
         Self::default()
     }
 
-    /// Record the stream format once it's known, so reports can carry it (lets
-    /// the UI convert buffer depths to milliseconds).
+    /// Record the current stream format, so reports can carry it (lets the UI
+    /// convert buffer depths to milliseconds). Updated on every source switch.
     pub fn set_format(&self, sample_rate: u32, channels: u16) {
         self.sample_rate.store(sample_rate, Ordering::Relaxed);
         self.channels.store(channels as u32, Ordering::Relaxed);
@@ -109,20 +127,31 @@ impl DeviceMetrics {
         rtt_ms: f64,
         samples: u32,
     ) {
-        self.clock_offset_bits.store(applied_ms.to_bits(), Ordering::Relaxed);
-        self.clock_target_bits.store(target_ms.to_bits(), Ordering::Relaxed);
-        self.last_offset_bits.store(last_offset_ms.to_bits(), Ordering::Relaxed);
-        self.last_rtt_bits.store(last_rtt_ms.to_bits(), Ordering::Relaxed);
+        self.clock_offset_bits
+            .store(applied_ms.to_bits(), Ordering::Relaxed);
+        self.clock_target_bits
+            .store(target_ms.to_bits(), Ordering::Relaxed);
+        self.last_offset_bits
+            .store(last_offset_ms.to_bits(), Ordering::Relaxed);
+        self.last_rtt_bits
+            .store(last_rtt_ms.to_bits(), Ordering::Relaxed);
         self.rtt_bits.store(rtt_ms.to_bits(), Ordering::Relaxed);
         self.sync_samples.store(samples, Ordering::Relaxed);
     }
 
-    /// A wire snapshot of all current values, stamped with the local clock.
+    /// A wire snapshot of all current values, stamped with the local clock. The
+    /// client-owned settings fields (selected source / volume / delay) are left
+    /// at defaults here and filled by the telemetry sender from [`ClientSettings`].
     pub fn snapshot(&self) -> TelemetryReport {
         TelemetryReport {
             sent_ms: now_epoch_ms(),
+            mac: [0; 6],
+            hostname: String::new(),
             sample_rate: self.sample_rate.load(Ordering::Relaxed),
             channels: self.channels.load(Ordering::Relaxed) as u16,
+            selected_source_id: 0,
+            volume: 0.0,
+            delay_ms: 0,
             blocks_appended: self.blocks_appended.load(Ordering::Relaxed),
             samples_appended: self.samples_appended.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
@@ -142,14 +171,45 @@ impl DeviceMetrics {
     }
 }
 
-/// Client: every `interval_ms`, snapshot `metrics` and send it to the server.
-/// Waits (polling `server_ip`) until the server address is known, since it's
-/// learned from the first multicast datagram. Runs forever; intended for a
-/// thread.
+/// Servers currently requesting telemetry from this client, each with a deadline
+/// (epoch ms) after which we stop sending unless another ping refreshes it.
+#[derive(Default)]
+pub struct TelemetryTargets {
+    inner: Mutex<HashMap<Ipv4Addr, u64>>,
+}
+
+impl TelemetryTargets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A ping arrived from `ip`: stream to it for the next grace window.
+    pub fn refresh(&self, ip: Ipv4Addr) {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(ip, now_epoch_ms() + TELEMETRY_GRACE_MS);
+    }
+
+    /// The servers we should unicast to right now (expired ones pruned).
+    fn active(&self) -> Vec<Ipv4Addr> {
+        let now = now_epoch_ms();
+        let mut m = self.inner.lock().unwrap();
+        m.retain(|_, deadline| *deadline > now);
+        m.keys().copied().collect()
+    }
+}
+
+/// Client: while at least one server is asking (via pings tracked in `targets`),
+/// snapshot `metrics` + the client-owned `settings` every `interval_ms` and
+/// *unicast* the report to each requesting server. Sends nothing when no server
+/// is watching. Runs forever; intended for a thread.
 pub fn run_telemetry_sender(
-    server_ip: Arc<Mutex<Option<Ipv4Addr>>>,
-    port: u16,
+    settings: Arc<ClientSettings>,
     metrics: Arc<DeviceMetrics>,
+    mac: [u8; 6],
+    hostname: String,
+    targets: Arc<TelemetryTargets>,
     interval_ms: u64,
 ) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
@@ -159,16 +219,54 @@ pub fn run_telemetry_sender(
             return;
         }
     };
-    let interval = std::time::Duration::from_millis(interval_ms);
+    let interval = Duration::from_millis(interval_ms);
     loop {
-        let dest = *server_ip.lock().unwrap();
-        if let Some(ip) = dest {
-            let report = metrics.snapshot();
+        let dests = targets.active();
+        if !dests.is_empty() {
+            let mut report = metrics.snapshot();
+            let (sel, vol, delay) = settings.report_values();
+            report.selected_source_id = sel;
+            report.volume = vol;
+            report.delay_ms = delay;
+            report.mac = mac;
+            report.hostname = hostname.clone();
             if let Ok(bytes) = bincode::serialize(&report) {
-                let _ = sock.send_to(&bytes, (ip, port));
+                for ip in dests {
+                    let _ = sock.send_to(&bytes, (ip, TELEMETRY_PORT));
+                }
             }
         }
         std::thread::sleep(interval);
+    }
+}
+
+/// Client: listen for telemetry-request pings and record which servers to stream
+/// to (in `targets`). Runs forever; intended for a thread.
+pub fn run_telemetry_ping_listener(targets: Arc<TelemetryTargets>, iface: Ipv4Addr) {
+    let sock = match bind_reuse(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, TELEMETRY_REQ_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("telemetry ping listener: could not bind {TELEMETRY_REQ_PORT}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = sock.join_multicast_v4(&TELEMETRY_REQ_GROUP, &iface) {
+        eprintln!("telemetry ping listener: could not join {TELEMETRY_REQ_GROUP}: {e}");
+    }
+    let mut buf = [0u8; 256];
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((n, SocketAddr::V4(src))) => {
+                if bincode::deserialize::<TelemetryRequest>(&buf[..n]).is_ok() {
+                    targets.refresh(*src.ip());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("telemetry ping listener: recv error: {e}");
+                return;
+            }
+        }
     }
 }
 
@@ -176,8 +274,8 @@ pub fn run_telemetry_sender(
 // Server side
 // ---------------------------------------------------------------------------
 
-/// Server-side send-path metrics, written by the multicast send loop and sampled
-/// into the telemetry store for the UI.
+/// Server-side send-path metrics for one source, written by that source's send
+/// loop and sampled into the telemetry store for the UI.
 #[derive(Debug, Default)]
 pub struct ServerMetrics {
     packets_sent: AtomicU64,
@@ -275,59 +373,128 @@ struct ClientHistory {
     sample_rate: u32,
     channels: u16,
     last_report_ms: u64,
+    /// Highest client-clock send time seen, to drop out-of-order/duplicate
+    /// reports (multicast can deliver in bursts / reorder).
+    last_sent_ms: u64,
+    /// Current source IP of the client (for targeting control commands).
+    ip: Ipv4Addr,
+    /// Device hostname reported by the client (the default display name).
+    hostname: String,
+    // Latest reported client-owned settings, for the /api/clients list.
+    volume: f32,
+    delay_ms: u32,
+    selected_source_id: u64,
 }
 
 /// Per-device stats emitted to the UI: the recent history window plus context.
+/// Keyed by MAC so the UI can match it to the client list.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientStats {
-    pub ip: String,
+    pub mac: String,
     pub sample_rate: u32,
     pub channels: u16,
     pub seconds_ago: f64,
     pub samples: Vec<ClientSample>,
 }
 
-/// The full `/api/stats` payload: server history + one entry per device.
+/// One server source's send-path stats (one UI "server" card per source).
 #[derive(Debug, Clone, Serialize)]
-pub struct StatsSnapshot {
-    pub now_ms: u64,
+pub struct ServerSourceStats {
+    /// Source id as a string (see module note on JS integer range).
+    pub source_id: String,
+    pub name: String,
     pub sample_rate: u32,
     pub channels: u16,
     pub lead_ms: u32,
-    pub server: Vec<ServerSample>,
+    /// True if hosted by a different server (learned via the stats broadcast).
+    pub remote: bool,
+    pub samples: Vec<ServerSample>,
+}
+
+/// Metadata for one source the UI should show a send-path card for. Built by the
+/// caller from the catalog, so it spans local and remote servers.
+pub struct SourceMeta {
+    pub id: u64,
+    pub name: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub lead_ms: u32,
+    pub remote: bool,
+}
+
+/// The full `/api/stats` payload: per-source server history + one entry per device.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatsSnapshot {
+    pub now_ms: u64,
+    pub server: Vec<ServerSourceStats>,
     pub clients: Vec<ClientStats>,
 }
 
+/// A client's latest state for the `/api/clients` list (not the graph history).
+pub struct ClientSummary {
+    pub mac: [u8; 6],
+    pub ip: Ipv4Addr,
+    pub hostname: String,
+    pub seconds_ago: f64,
+    pub connected: bool,
+    pub volume: f32,
+    pub delay_ms: u32,
+    pub selected_source_id: u64,
+}
+
 /// Server-side ring buffers of recent telemetry, keyed by client IP, plus the
-/// server's own send-path history. Fed by the telemetry receiver and a periodic
-/// server-metrics sampler; read by the HTTP `/api/stats` handler.
+/// per-source server send-path history. Fed by the telemetry receiver and a
+/// periodic server-metrics sampler; read by the HTTP `/api/*` handlers.
 pub struct TelemetryStore {
-    clients: Mutex<HashMap<Ipv4Addr, ClientHistory>>,
-    server: Mutex<VecDeque<ServerSample>>,
+    /// Keyed by client MAC (stable across IP changes / restarts).
+    clients: Mutex<HashMap<[u8; 6], ClientHistory>>,
+    server_hist: Mutex<HashMap<u64, VecDeque<ServerSample>>>,
 }
 
 impl TelemetryStore {
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
-            server: Mutex::new(VecDeque::new()),
+            server_hist: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Record a report received from `ip` at server time `recv_ms`.
+    /// Record a report received from `ip` at server time `recv_ms`, keyed by the
+    /// client's MAC.
     pub fn push_client(&self, ip: Ipv4Addr, report: TelemetryReport, recv_ms: u64) {
         let mut map = self.clients.lock().unwrap();
-        let hist = map.entry(ip).or_insert_with(|| ClientHistory {
+        let hist = map.entry(report.mac).or_insert_with(|| ClientHistory {
             samples: VecDeque::new(),
             sample_rate: report.sample_rate,
             channels: report.channels,
             last_report_ms: recv_ms,
+            last_sent_ms: 0,
+            ip,
+            hostname: report.hostname.clone(),
+            volume: report.volume,
+            delay_ms: report.delay_ms,
+            selected_source_id: report.selected_source_id,
         });
+        // Drop reordered/duplicate reports so the graph x-axis stays monotonic.
+        if report.sent_ms <= hist.last_sent_ms {
+            return;
+        }
+        hist.last_sent_ms = report.sent_ms;
+        // Plot each sample at the client's *send* time, mapped onto the server
+        // clock via the reported offset. The client sends at an even 10 Hz, so
+        // this spaces samples evenly regardless of multicast delivery jitter
+        // (receive-time spacing is bursty over a real network → choppy graphs).
+        let disp_t = (report.sent_ms as f64 + report.clock_offset_ms).max(0.0) as u64;
         hist.sample_rate = report.sample_rate;
         hist.channels = report.channels;
         hist.last_report_ms = recv_ms;
+        hist.ip = ip;
+        hist.hostname = report.hostname.clone();
+        hist.volume = report.volume;
+        hist.delay_ms = report.delay_ms;
+        hist.selected_source_id = report.selected_source_id;
         hist.samples.push_back(ClientSample {
-            t: recv_ms,
+            t: disp_t,
             blocks_appended: report.blocks_appended,
             samples_appended: report.samples_appended,
             packets_received: report.packets_received,
@@ -349,39 +516,87 @@ impl TelemetryStore {
         }
     }
 
-    /// Record a server send-path sample.
-    pub fn push_server(&self, sample: ServerSample) {
-        let mut q = self.server.lock().unwrap();
+    /// Record a server send-path sample for one source.
+    pub fn push_server(&self, source_id: u64, sample: ServerSample) {
+        let mut map = self.server_hist.lock().unwrap();
+        let q = map.entry(source_id).or_default();
         q.push_back(sample);
         while q.len() > HISTORY_LEN {
             q.pop_front();
         }
     }
 
-    /// Build the `/api/stats` payload, dropping devices that have gone stale.
-    pub fn snapshot(&self, meta: &ServerMetrics) -> StatsSnapshot {
+    /// Each currently-known client's latest state, for the `/api/clients` list.
+    pub fn clients_summary(&self) -> Vec<ClientSummary> {
         let now = now_epoch_ms();
-        let server: Vec<ServerSample> = self.server.lock().unwrap().iter().copied().collect();
+        let mut map = self.clients.lock().unwrap();
+        map.retain(|_, h| (now.saturating_sub(h.last_report_ms) as f64) / 1000.0 < STALE_SECS);
+        let mut out: Vec<ClientSummary> = map
+            .iter()
+            .map(|(mac, h)| {
+                let secs = (now.saturating_sub(h.last_report_ms) as f64) / 1000.0;
+                ClientSummary {
+                    mac: *mac,
+                    ip: h.ip,
+                    hostname: h.hostname.clone(),
+                    seconds_ago: secs,
+                    connected: secs < CONNECTED_SECS,
+                    volume: h.volume,
+                    delay_ms: h.delay_ms,
+                    selected_source_id: h.selected_source_id,
+                }
+            })
+            .collect();
+        out.sort_by_key(|c| c.mac);
+        out
+    }
+
+    /// The current IP of the client with this MAC, if known — used to target
+    /// control commands (which address clients by IP).
+    pub fn ip_for_mac(&self, mac: [u8; 6]) -> Option<Ipv4Addr> {
+        self.clients.lock().unwrap().get(&mac).map(|h| h.ip)
+    }
+
+    /// Build the `/api/stats` payload for the given sources (local + remote,
+    /// from the catalog), dropping devices that have gone stale.
+    pub fn snapshot(&self, sources: &[SourceMeta]) -> StatsSnapshot {
+        let now = now_epoch_ms();
+
+        let hist = self.server_hist.lock().unwrap();
+        let mut server: Vec<ServerSourceStats> = sources
+            .iter()
+            .map(|m| ServerSourceStats {
+                source_id: m.id.to_string(),
+                name: m.name.clone(),
+                sample_rate: m.sample_rate,
+                channels: m.channels,
+                lead_ms: m.lead_ms,
+                remote: m.remote,
+                samples: hist
+                    .get(&m.id)
+                    .map(|q| q.iter().copied().collect())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        server.sort_by(|a, b| a.name.cmp(&b.name));
+        drop(hist);
 
         let mut map = self.clients.lock().unwrap();
         map.retain(|_, h| (now.saturating_sub(h.last_report_ms) as f64) / 1000.0 < STALE_SECS);
         let mut clients: Vec<ClientStats> = map
             .iter()
-            .map(|(ip, h)| ClientStats {
-                ip: ip.to_string(),
+            .map(|(mac, h)| ClientStats {
+                mac: crate::clients::mac_hex(*mac),
                 sample_rate: h.sample_rate,
                 channels: h.channels,
                 seconds_ago: (now.saturating_sub(h.last_report_ms) as f64) / 1000.0,
                 samples: h.samples.iter().copied().collect(),
             })
             .collect();
-        clients.sort_by(|a, b| a.ip.cmp(&b.ip));
+        clients.sort_by(|a, b| a.mac.cmp(&b.mac));
 
         StatsSnapshot {
             now_ms: now,
-            sample_rate: meta.sample_rate(),
-            channels: meta.channels(),
-            lead_ms: meta.lead_ms(),
             server,
             clients,
         }
@@ -394,28 +609,173 @@ impl Default for TelemetryStore {
     }
 }
 
-/// Server: receive client [`TelemetryReport`]s and record them in `store`,
-/// keyed by the datagram's source IP. Runs forever; intended for a thread.
-pub fn run_telemetry_receiver(port: u16, store: Arc<TelemetryStore>) {
-    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)) {
+/// Tracks whether a web user is currently present, so the server only requests
+/// telemetry from clients while someone is watching.
+#[derive(Debug, Default)]
+pub struct WebActivity {
+    last_poll_ms: AtomicU64,
+}
+
+impl WebActivity {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark that the UI just polled.
+    pub fn touch(&self) {
+        self.last_poll_ms.store(now_epoch_ms(), Ordering::Relaxed);
+    }
+
+    /// True if the UI polled within [`ACTIVE_WINDOW_MS`].
+    pub fn active(&self) -> bool {
+        now_epoch_ms().saturating_sub(self.last_poll_ms.load(Ordering::Relaxed)) < ACTIVE_WINDOW_MS
+    }
+}
+
+/// Server: receive unicast client [`TelemetryReport`]s into `store`, keyed by the
+/// datagram's source IP. Clients only send while this server is pinging them, so
+/// no gating is needed here. Runs forever; intended for a thread.
+pub fn run_telemetry_receiver(store: Arc<TelemetryStore>) {
+    let sock = match bind_reuse(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, TELEMETRY_PORT)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("telemetry receiver: could not bind {port}: {e}");
+            eprintln!("telemetry receiver: could not bind {TELEMETRY_PORT}: {e}");
             return;
         }
     };
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 2048];
     loop {
         match sock.recv_from(&mut buf) {
-            Ok((n, SocketAddr::V4(v4))) => {
+            Ok((n, SocketAddr::V4(src))) => {
                 if let Ok(report) = bincode::deserialize::<TelemetryReport>(&buf[..n]) {
-                    store.push_client(*v4.ip(), report, now_epoch_ms());
+                    store.push_client(*src.ip(), report, now_epoch_ms());
                 }
-                // Malformed datagram or non-IPv4 source: ignore.
             }
             Ok(_) => {}
             Err(e) => {
                 eprintln!("telemetry receiver: recv error: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Server: while a web user is active, multicast a telemetry-request ping on
+/// [`TELEMETRY_REQ_GROUP`] every [`TELEMETRY_PING_MS`], prompting clients to
+/// unicast their telemetry back. Silent when no one is watching. Runs forever.
+pub fn run_telemetry_requester(server_id: u64, activity: Arc<WebActivity>, iface: Ipv4Addr) {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("telemetry requester: could not bind: {e}");
+            return;
+        }
+    };
+    sock.set_multicast_ttl_v4(1).ok();
+    sock.set_multicast_loop_v4(true).ok();
+    if iface != Ipv4Addr::UNSPECIFIED {
+        let _ = set_multicast_if(&sock, iface);
+    }
+    let dest = (TELEMETRY_REQ_GROUP, TELEMETRY_REQ_PORT);
+    let bytes = bincode::serialize(&TelemetryRequest { server_id }).unwrap_or_default();
+    loop {
+        if activity.active() {
+            let _ = sock.send_to(&bytes, dest);
+        }
+        std::thread::sleep(Duration::from_millis(TELEMETRY_PING_MS));
+    }
+}
+
+/// How often a server broadcasts its send-path stats to other servers.
+const STATS_BROADCAST_MS: u64 = 250;
+
+/// Server: broadcast this server's per-source send-path stats on [`STATS_GROUP`]
+/// at ~4 Hz, so any server's UI can graph these streams. Runs forever.
+pub fn run_stats_broadcaster(
+    server_id: u64,
+    sources: Vec<(u64, Arc<ServerMetrics>)>,
+    iface: Ipv4Addr,
+) {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("stats broadcaster: could not bind: {e}");
+            return;
+        }
+    };
+    sock.set_multicast_ttl_v4(1).ok();
+    sock.set_multicast_loop_v4(true).ok();
+    if iface != Ipv4Addr::UNSPECIFIED {
+        let _ = set_multicast_if(&sock, iface);
+    }
+    let dest = (STATS_GROUP, STATS_PORT);
+    loop {
+        let stats: Vec<SourceStat> = sources
+            .iter()
+            .map(|(id, m)| {
+                let s = m.snapshot();
+                SourceStat {
+                    source_id: *id,
+                    packets_sent: s.packets_sent,
+                    frames_sent: s.frames_sent,
+                    reanchors: s.reanchors,
+                    pending_len: s.pending_len,
+                }
+            })
+            .collect();
+        let msg = StatsBroadcast {
+            server_id,
+            sent_ms: now_epoch_ms(),
+            sources: stats,
+        };
+        if let Ok(bytes) = bincode::serialize(&msg) {
+            let _ = sock.send_to(&bytes, dest);
+        }
+        std::thread::sleep(Duration::from_millis(STATS_BROADCAST_MS));
+    }
+}
+
+/// Server: receive other servers' stats broadcasts into `store` so their streams
+/// graph alongside the local ones. Own broadcasts (matching `my_server_id`) are
+/// ignored — the local sampler already records them at full rate. Runs forever.
+pub fn run_stats_receiver(store: Arc<TelemetryStore>, my_server_id: u64, iface: Ipv4Addr) {
+    let sock = match bind_reuse(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, STATS_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("stats receiver: could not bind {STATS_PORT}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = sock.join_multicast_v4(&STATS_GROUP, &iface) {
+        eprintln!("stats receiver: could not join {STATS_GROUP}: {e}");
+    }
+    let mut buf = [0u8; 65536];
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                if let Ok(msg) = bincode::deserialize::<StatsBroadcast>(&buf[..n]) {
+                    if msg.server_id == my_server_id {
+                        continue; // our own — already sampled locally at full rate
+                    }
+                    // Stamp with our receive time so remote streams share this
+                    // server's timeline (and right edge) on the graphs.
+                    let t = now_epoch_ms();
+                    for st in msg.sources {
+                        store.push_server(
+                            st.source_id,
+                            ServerSample {
+                                t,
+                                packets_sent: st.packets_sent,
+                                frames_sent: st.frames_sent,
+                                reanchors: st.reanchors,
+                                pending_len: st.pending_len,
+                            },
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("stats receiver: recv error: {e}");
                 return;
             }
         }
