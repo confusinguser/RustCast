@@ -33,6 +33,9 @@ pub const DEFAULT_SYNC_PORT: u16 = 5005;
 /// Catalog announcements (server → everyone).
 pub const ANNOUNCE_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 100);
 pub const ANNOUNCE_PORT: u16 = 5008;
+/// Unicast port each server answers catalog requests on, for clients started
+/// with `--server <ip>` where multicast discovery doesn't route.
+pub const CATALOG_REQ_PORT: u16 = 5007;
 /// Control commands (server → clients).
 pub const CONTROL_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 101);
 pub const CONTROL_PORT: u16 = 5009;
@@ -127,10 +130,19 @@ pub struct AudioPacket {
     /// packet's first sample.
     pub play_at_ms: u64,
     pub sample_rate: u32,
+    /// Number of channels physically present in `data` (may be a subset of the
+    /// source's channels in unicast mode — see `channel_ids`).
     pub channels: u16,
     pub format: WireFormat,
-    /// PCM samples encoded per `format`, interleaved across channels.
+    /// PCM samples encoded per `format`, interleaved across `channels`.
     pub data: Vec<u8>,
+    /// The source-channel index of each channel carried in `data`, in order.
+    /// Empty ⇒ `data` holds every source channel contiguously (0..channels) — the
+    /// multicast / full-stream case. In unicast mode a client that only maps a
+    /// subset of source channels is sent just those, saving bandwidth; this lists
+    /// which ones so the client can route them back by original source index.
+    #[serde(default)]
+    pub channel_ids: Vec<u16>,
 }
 
 /// NTP-style time-sync request sent by a client to the server (unicast). Also
@@ -145,6 +157,12 @@ pub struct TimeRequest {
     pub nonce: u64,
     /// The source this client is currently playing (0 = none).
     pub selected_source_id: u64,
+    /// The client's current output channel map (one source-channel index per
+    /// output channel; `-1` = silence; empty = default identity). The owning
+    /// server uses it to stream only the source channels this client actually
+    /// plays when in unicast mode. Empty ⇒ send the full stream.
+    #[serde(default)]
+    pub channel_map: Vec<i16>,
 }
 
 /// The server's reply to a [`TimeRequest`].
@@ -175,6 +193,14 @@ pub struct CatalogEntry {
     pub format: WireFormat,
     /// Server's send lead in ms (jitter-buffer depth), for the UI.
     pub lead_ms: u32,
+}
+
+/// A client's unicast request for a server's catalog (sent to [`CATALOG_REQ_PORT`]
+/// when started with `--server <ip>`). The server replies with a [`CatalogAnnounce`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogRequest {
+    /// Correlates a response with its request.
+    pub nonce: u64,
 }
 
 /// A server's periodic advertisement of the sources it hosts. Multicast on
@@ -225,6 +251,10 @@ pub struct ControlCommand {
     pub set_source_id: Option<u64>,
     pub set_volume: Option<f32>,
     pub set_delay_ms: Option<u32>,
+    /// `None` = leave unchanged. Otherwise the output channel map: one entry per
+    /// output channel, giving the source channel index it plays (`-1` = silence).
+    #[serde(default)]
+    pub set_channel_map: Option<Vec<i16>>,
 }
 
 /// A telemetry snapshot a client streams to every server over TCP (~10 Hz) so
@@ -236,13 +266,18 @@ pub struct ControlCommand {
 pub struct TelemetryReport {
     /// Client's local clock (epoch ms) at report time.
     pub sent_ms: u64,
-    /// Stable device identity: primary NIC MAC (or a hostname-derived fallback).
+    /// Stable device identity string: the `--id` value if given, else the primary
+    /// NIC MAC in hex. This is the key every server stores the client under.
+    pub device_id: String,
+    /// Primary NIC MAC (or a hostname-derived fallback), kept for display only.
     pub mac: [u8; 6],
     /// The device's hostname, the default display name until overridden.
     pub hostname: String,
     /// Stream format, so the UI can convert buffer depths to milliseconds.
     pub sample_rate: u32,
     pub channels: u16,
+    /// Number of channels on the client's output device (for the routing matrix).
+    pub output_channels: u16,
     // --- client-owned settings (the client is the source of truth) ---
     /// Currently-selected source id (0 = off / playing nothing).
     pub selected_source_id: u64,
@@ -250,6 +285,10 @@ pub struct TelemetryReport {
     pub volume: f32,
     /// Playback advance in milliseconds (played this much earlier than play_at).
     pub delay_ms: u32,
+    /// Output channel map: one source-channel index per output channel (`-1` =
+    /// silence). Empty means the default identity mapping.
+    #[serde(default)]
+    pub channel_map: Vec<i16>,
     // --- counters (cumulative) ---
     /// Sample blocks handed to the player (`player.append`).
     pub blocks_appended: u64,

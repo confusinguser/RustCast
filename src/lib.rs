@@ -9,11 +9,13 @@
 
 pub mod api;
 pub mod catalog;
+pub mod client;
 pub mod clients;
 pub mod config;
 pub mod metrics;
 pub mod net;
 pub mod source;
 pub mod stream;
+pub mod supervisor;
 pub mod sync;
 pub mod wire;

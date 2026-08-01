@@ -14,10 +14,17 @@ use std::time::{Duration, Instant};
 
 use crate::net::{bind_reuse, set_multicast_if};
 use crate::stream::SendParams;
-use crate::wire::{ANNOUNCE_GROUP, ANNOUNCE_PORT, CatalogAnnounce, CatalogEntry, now_epoch_ms};
+use crate::wire::{
+    ANNOUNCE_GROUP, ANNOUNCE_PORT, CATALOG_REQ_PORT, CatalogAnnounce, CatalogEntry, CatalogRequest,
+    now_epoch_ms,
+};
 
 /// How often a server re-advertises its catalog.
 const ANNOUNCE_INTERVAL_MS: u64 = 3000;
+
+/// Supplies the current catalog entries (with live send params). Read fresh each
+/// time so a hot-added/removed source is reflected without a restart.
+pub type EntriesProvider = Arc<dyn Fn() -> Vec<(CatalogEntry, Arc<SendParams>)> + Send + Sync>;
 /// Drop a server's sources if we haven't heard an announcement in this long
 /// (~5 missed announcements).
 const ANNOUNCE_STALE: Duration = Duration::from_secs(15);
@@ -115,7 +122,9 @@ impl CatalogStore {
 
     /// How to reach one source id, if it is currently advertised.
     pub fn resolve(&self, id: u64) -> Option<ResolvedSource> {
-        self.snapshot().into_iter().find(|r| r.entry.source_id == id)
+        self.snapshot()
+            .into_iter()
+            .find(|r| r.entry.source_id == id)
     }
 
     /// IPs of every server currently heard (for the client's TCP telemetry fan-out).
@@ -134,6 +143,32 @@ impl Default for CatalogStore {
     }
 }
 
+/// Build this server's current [`CatalogAnnounce`], reading each source's live
+/// `lead_ms` from its [`SendParams`]. `server_ip` is left 0; the receiver fills
+/// it from the datagram's source address. Shared by the announcer and the
+/// unicast catalog responder.
+pub fn build_announce(
+    server_id: u64,
+    sync_port: u16,
+    sources: &[(CatalogEntry, Arc<SendParams>)],
+) -> CatalogAnnounce {
+    let entries: Vec<CatalogEntry> = sources
+        .iter()
+        .map(|(e, p)| {
+            let mut e = e.clone();
+            e.lead_ms = p.lead() as u32;
+            e
+        })
+        .collect();
+    CatalogAnnounce {
+        server_id,
+        server_ip: [0, 0, 0, 0],
+        sync_port,
+        sent_ms: now_epoch_ms(),
+        sources: entries,
+    }
+}
+
 /// Server: multicast this server's catalog every [`ANNOUNCE_INTERVAL_MS`]. Each
 /// source's `lead_ms` is read live from its [`SendParams`], so a lead adjusted
 /// from the UI propagates to clients on the next announcement. Runs forever;
@@ -141,7 +176,7 @@ impl Default for CatalogStore {
 pub fn run_catalog_announcer(
     server_id: u64,
     sync_port: u16,
-    sources: Arc<Vec<(CatalogEntry, Arc<SendParams>)>>,
+    sources: EntriesProvider,
     iface: Ipv4Addr,
 ) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
@@ -159,25 +194,74 @@ pub fn run_catalog_announcer(
     }
     let dest = (ANNOUNCE_GROUP, ANNOUNCE_PORT);
     loop {
-        let entries: Vec<CatalogEntry> = sources
-            .iter()
-            .map(|(e, p)| {
-                let mut e = e.clone();
-                e.lead_ms = p.lead() as u32;
-                e
-            })
-            .collect();
-        let announce = CatalogAnnounce {
-            server_id,
-            server_ip: [0, 0, 0, 0], // the receiver fills this from the datagram source
-            sync_port,
-            sent_ms: now_epoch_ms(),
-            sources: entries,
-        };
+        let announce = build_announce(server_id, sync_port, &sources());
         if let Ok(bytes) = bincode::serialize(&announce) {
             let _ = sock.send_to(&bytes, dest);
         }
         std::thread::sleep(Duration::from_millis(ANNOUNCE_INTERVAL_MS));
+    }
+}
+
+/// Server: answer unicast [`CatalogRequest`]s on [`CATALOG_REQ_PORT`] with this
+/// server's current catalog, so a client started with `--server <ip>` can learn
+/// the sources without multicast. Runs forever; intended for its own thread.
+pub fn run_catalog_responder(server_id: u64, sync_port: u16, sources: EntriesProvider) {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CATALOG_REQ_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("catalog responder: could not bind {CATALOG_REQ_PORT}: {e}");
+            return;
+        }
+    };
+    let mut buf = [0u8; 2048];
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                if bincode::deserialize::<CatalogRequest>(&buf[..n]).is_err() {
+                    continue; // ignore junk
+                }
+                let announce = build_announce(server_id, sync_port, &sources());
+                if let Ok(bytes) = bincode::serialize(&announce) {
+                    let _ = sock.send_to(&bytes, src);
+                }
+            }
+            Err(e) => {
+                eprintln!("catalog responder: recv error: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Client: when started with `--server <ip>`, periodically fetch that server's
+/// catalog by unicast and merge it into `store`, overriding the announce's
+/// `server_ip` with the known server address. Complements multicast discovery
+/// (both feed the same [`CatalogStore`]). Runs forever; intended for its thread.
+pub fn run_unicast_catalog_client(server_ip: Ipv4Addr, store: Arc<CatalogStore>) {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("unicast catalog client: could not bind: {e}");
+            return;
+        }
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(1000)));
+    let dest = (server_ip, CATALOG_REQ_PORT);
+    let mut nonce: u64 = 1;
+    let mut buf = [0u8; 65536];
+    loop {
+        let req = CatalogRequest { nonce };
+        nonce = nonce.wrapping_add(1);
+        if let Ok(bytes) = bincode::serialize(&req) {
+            let _ = sock.send_to(&bytes, dest);
+        }
+        if let Ok((n, _)) = sock.recv_from(&mut buf)
+            && let Ok(mut announce) = bincode::deserialize::<CatalogAnnounce>(&buf[..n])
+        {
+            announce.server_ip = server_ip.octets();
+            store.merge(announce);
+        }
+        std::thread::sleep(Duration::from_millis(2000));
     }
 }
 

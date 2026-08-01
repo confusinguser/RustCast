@@ -14,13 +14,21 @@
 //! in the user's audio session (with `XDG_RUNTIME_DIR` set) to reach the server.
 
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
-use super::{AudioSource, Format};
+use super::{AudioSource, Format, poll_readable};
 
 /// `parec` is asked for s16le; we decode that to f32 (as the pipe source does).
 const BYTES_PER_SAMPLE: usize = 2;
+
+/// Capture latency requested from the audio server. Without this, `parec` lets
+/// the server pick, and monitor sources in particular default to a very large
+/// fragment (seconds of buffering) before any audio reaches our stdout pipe.
+/// A small value makes `parec` deliver captured audio promptly; the client-side
+/// jitter buffer (send lead) still absorbs delivery jitter downstream.
+const CAPTURE_LATENCY_MS: u32 = 5;
 
 /// Which audio-server endpoint to capture.
 pub enum PulseKind {
@@ -49,7 +57,9 @@ impl PulseSource {
     pub fn open(kind: PulseKind, format: Format) -> io::Result<Self> {
         let (device, module_id) = match kind {
             PulseKind::Sink { sink_name } => {
-                let id = ensure_null_sink(&sink_name)?;
+                // Create the virtual sink with the configured channel count, so it
+                // presents that many channels to applications (default is stereo).
+                let id = ensure_null_sink(&sink_name, format.channels)?;
                 (format!("{sink_name}.monitor"), id)
             }
             PulseKind::Source { device } => (device.unwrap_or_default(), None),
@@ -58,7 +68,8 @@ impl PulseSource {
         let mut cmd = Command::new("parec");
         cmd.arg("--format=s16le")
             .arg(format!("--rate={}", format.sample_rate))
-            .arg(format!("--channels={}", format.channels));
+            .arg(format!("--channels={}", format.channels))
+            .arg(format!("--latency-msec={CAPTURE_LATENCY_MS}"));
         if !device.is_empty() {
             cmd.arg(format!("--device={device}"));
         }
@@ -110,8 +121,12 @@ impl AudioSource for PulseSource {
         Ok(Some(samples))
     }
 
-    fn next_samples_timeout(&mut self, _duration: Duration) -> io::Result<Option<Vec<f32>>> {
-        // Capture is realtime-paced, so a plain (effectively prompt) read is fine.
+    fn next_samples_timeout(&mut self, duration: Duration) -> io::Result<Option<Vec<f32>>> {
+        // Bounded wait so the read loop can check its stop flag between chunks
+        // (used for hot-removal); an empty vec means "nothing yet".
+        if !poll_readable(self.stdout.as_raw_fd(), duration)? {
+            return Ok(Some(Vec::new()));
+        }
         self.next_samples()
     }
 }
@@ -131,7 +146,7 @@ impl Drop for PulseSource {
 /// created, or `None` if the sink already existed (so we don't unload someone
 /// else's — and so a SIGKILL-orphaned sink is reused across restarts, not
 /// duplicated).
-fn ensure_null_sink(sink_name: &str) -> io::Result<Option<String>> {
+fn ensure_null_sink(sink_name: &str, channels: u16) -> io::Result<Option<String>> {
     if sink_exists(sink_name) {
         return Ok(None);
     }
@@ -139,6 +154,7 @@ fn ensure_null_sink(sink_name: &str) -> io::Result<Option<String>> {
         .arg("load-module")
         .arg("module-null-sink")
         .arg(format!("sink_name={sink_name}"))
+        .arg(format!("channels={}", channels.max(1)))
         .arg(format!("sink_properties=device.description={sink_name}"))
         .output()
         .map_err(|e| io::Error::new(e.kind(), format!("could not run `pactl`: {e}")))?;

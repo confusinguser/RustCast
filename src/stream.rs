@@ -4,7 +4,7 @@
 //! are fully independent — one ending never disturbs the others.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -14,11 +14,11 @@ use std::time::Duration;
 use crate::config::SourceKind;
 use crate::metrics::ServerMetrics;
 use crate::net::set_multicast_if;
-use crate::sync::Listeners;
 use crate::source::librespot::LibrespotSource;
 use crate::source::pipe::PipeSource;
 use crate::source::pulse::{PulseKind, PulseSource};
 use crate::source::{AudioSource, Format};
+use crate::sync::Listeners;
 use crate::wire::{
     AUDIO_PORT, AudioPacket, MAX_LEAD_MS, TARGET_PCM_BYTES, WireFormat, now_epoch_ms,
 };
@@ -32,6 +32,9 @@ pub const MAX_COPIES: u32 = 8;
 const MULTICAST_TTL: u32 = 1;
 /// If the timeline falls this far behind real time, re-anchor it.
 const REANCHOR_TOLERANCE_MS: u64 = 60;
+/// Max time a source read blocks before the loop re-checks its stop flag, so a
+/// hot-removed source is torn down promptly (its `Drop` kills `parec` etc.).
+const READ_POLL_MS: u64 = 100;
 
 /// Live, runtime-adjustable send timing for one source, shared between the send
 /// loop, the catalog announcer (reads `lead`), and the HTTP API (writes).
@@ -72,24 +75,29 @@ impl SendParams {
     }
 
     pub fn set_lead(&self, ms: u64) {
-        self.lead_ms.store(ms.clamp(1, MAX_LEAD_MS), Ordering::Relaxed);
+        self.lead_ms
+            .store(ms.clamp(1, MAX_LEAD_MS), Ordering::Relaxed);
     }
     pub fn set_redundancy(&self, n: u32) {
         self.redundancy
             .store(n.clamp(1, MAX_COPIES), Ordering::Relaxed);
     }
     pub fn set_last_lead(&self, ms: u64) {
-        self.last_lead_ms.store(ms.min(MAX_LEAD_MS), Ordering::Relaxed);
+        self.last_lead_ms
+            .store(ms.min(MAX_LEAD_MS), Ordering::Relaxed);
     }
     pub fn set_unicast(&self, on: bool) {
         self.unicast.store(on, Ordering::Relaxed);
     }
 }
 
-/// A scheduled redundant copy: send `bytes` (a serialized packet) at wall-clock
-/// `at` (epoch ms). Ordered by `at` only, for the retransmit min-heap.
+/// A scheduled redundant copy: send `bytes` (a serialized packet) to `dest` at
+/// wall-clock `at` (epoch ms). Pre-addressed at enqueue time, since a client's
+/// channel subset makes the payload per-destination. Ordered by `at` only, for
+/// the retransmit min-heap.
 struct Copy {
     at: u64,
+    dest: (Ipv4Addr, u16),
     bytes: Arc<Vec<u8>>,
 }
 impl PartialEq for Copy {
@@ -158,23 +166,76 @@ pub fn open_source(kind: &SourceKind) -> std::io::Result<Box<dyn AudioSource>> {
     }
 }
 
-/// Where a source's packets go right now: the multicast group, or (in unicast
-/// mode) each currently-listening client. Empty ⇒ nobody listening ⇒ send nothing.
+/// Where a source's packets go right now, each with the channel subset to send
+/// (`None` = the full stream). Multicast mode → the group, full stream. Unicast
+/// mode → each currently-listening client, with only the source channels its
+/// output map plays. Empty ⇒ nobody listening ⇒ send nothing.
 fn dests(
     params: &SendParams,
     group: Ipv4Addr,
     source_id: u64,
     listeners: &Listeners,
-) -> Vec<(Ipv4Addr, u16)> {
-    let ls = listeners.listeners(source_id);
-    if ls.is_empty() {
+    src_channels: usize,
+) -> Vec<(Ipv4Addr, u16, Option<Vec<u16>>)> {
+    let targets = listeners.targets(source_id);
+    if targets.is_empty() {
         return Vec::new(); // no listeners: idle source sends nothing
     }
     if params.unicast() {
-        ls.into_iter().map(|ip| (ip, AUDIO_PORT)).collect()
+        targets
+            .into_iter()
+            .map(|(ip, map)| (ip, AUDIO_PORT, needed_channels(&map, src_channels)))
+            .collect()
     } else {
-        vec![(group, AUDIO_PORT)]
+        vec![(group, AUDIO_PORT, None)]
     }
+}
+
+/// The distinct source channels a client with output `map` actually plays, on a
+/// source with `src_channels` channels — or `None` to send the full stream.
+///
+/// `None` when the map is the default identity (empty) or already covers every
+/// source channel: in both cases the full contiguous stream is what's wanted, so
+/// all such clients (and multicast) can share one serialized packet. Otherwise
+/// `Some(sorted, distinct, in-range indices)` — the subset to send.
+fn needed_channels(map: &[i16], src_channels: usize) -> Option<Vec<u16>> {
+    if map.is_empty() || src_channels == 0 {
+        return None;
+    }
+    let mut set: Vec<u16> = Vec::new();
+    for &m in map {
+        if m >= 0 && (m as usize) < src_channels && !set.contains(&(m as u16)) {
+            set.push(m as u16);
+        }
+    }
+    set.sort_unstable();
+    // All-silence (empty) or full coverage ⇒ just send the whole stream.
+    if set.is_empty() || set.len() == src_channels {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+/// Extract `subset` source channels from interleaved `full` (`src_channels` wide)
+/// into a new interleaved buffer `subset.len()` channels wide, in `subset` order.
+fn select_channels(full: &[f32], src_channels: usize, subset: &[u16]) -> Vec<f32> {
+    if src_channels == 0 {
+        return Vec::new();
+    }
+    let frames = full.len() / src_channels;
+    let width = subset.len();
+    let mut out = vec![0.0f32; frames * width];
+    for (oi, &c) in subset.iter().enumerate() {
+        let c = c as usize;
+        if c >= src_channels {
+            continue;
+        }
+        for f in 0..frames {
+            out[f * width + oi] = full[f * src_channels + c];
+        }
+    }
+    out
 }
 
 /// Read `kind` and stream it as timestamped PCM — to the source's multicast
@@ -193,6 +254,7 @@ pub fn run_source_stream(
     params: Arc<SendParams>,
     listeners: Arc<Listeners>,
     metrics: Arc<ServerMetrics>,
+    stop: Arc<AtomicBool>,
 ) {
     let mut source = match open_source(&kind) {
         Ok(s) => s,
@@ -221,17 +283,14 @@ pub fn run_source_stream(
         let _ = set_multicast_if(&socket, iface);
     }
     // Redundant copies (copies 1..N) are handed to a companion thread that sends
-    // each at its scheduled time, so the read/pacing loop never blocks on them.
-    // It resolves destinations live, so it honors unicast mode and idle-stop too.
+    // each to its (pre-resolved) destination at its scheduled time, so the
+    // read/pacing loop never blocks on them.
     let (tx, rx) = mpsc::channel::<Copy>();
     {
         let socket = socket.clone();
-        let name = name.clone();
-        let params = params.clone();
-        let listeners = listeners.clone();
         std::thread::Builder::new()
             .name(format!("retx-{name}"))
-            .spawn(move || run_retransmit(socket, group, source_id, params, listeners, rx))
+            .spawn(move || run_retransmit(socket, rx))
             .expect("spawn retransmit thread");
     }
 
@@ -256,21 +315,21 @@ pub fn run_source_stream(
     let mut pending: Vec<f32> = Vec::with_capacity(samples_per_packet * 2);
 
     loop {
-        // With pending samples, read with a short timeout; otherwise block.
-        let have_pending = !pending.is_empty();
-        let samples = if have_pending {
-            source.next_samples_timeout(Duration::from_millis(20))
-        } else {
-            source.next_samples()
-        };
+        // Stop promptly when hot-removed (drops the source, running its cleanup).
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
 
-        match samples {
+        // Bounded read so the loop re-checks `stop` between chunks. An empty vec
+        // means the timeout elapsed with no new data.
+        match source.next_samples_timeout(Duration::from_millis(READ_POLL_MS)) {
             Ok(Some(s)) => pending.extend_from_slice(&s),
-            // Timeout with a partial packet buffered: drop the sub-packet remnant.
-            Ok(None) if have_pending => pending.clear(),
             // End of stream: reopen so the source stays in the catalog. Reopening
             // a FIFO blocks until a new writer connects (the natural behavior).
             Ok(None) => {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 match open_source(&kind) {
                     Ok(s) => source = s,
                     Err(e) => {
@@ -287,10 +346,9 @@ pub fn run_source_stream(
             }
         }
 
-        while !pending.is_empty() {
-            let chunk: Vec<f32> = pending
-                .drain(..samples_per_packet.min(pending.len()))
-                .collect();
+        // Emit only whole packets; keep any sub-packet remainder for the next read.
+        while pending.len() >= samples_per_packet {
+            let chunk: Vec<f32> = pending.drain(..samples_per_packet).collect();
 
             // Live send timing. `lead` is when the first copy goes (play - lead);
             // `last_lead` (< lead) is when the last of `copies` copies goes.
@@ -316,46 +374,69 @@ pub fn run_source_stream(
                 std::thread::sleep(Duration::from_millis(send_at_ms - now));
             }
 
-            let pkt = AudioPacket {
-                source_id,
-                seq,
-                play_at_ms,
-                sample_rate: fmt.sample_rate,
-                channels: fmt.channels,
-                format: wire_fmt,
-                data: wire_fmt.encode(&chunk),
-            };
-            // Only put anything on the wire if someone is listening.
-            let targets = dests(&params, group, source_id, &listeners);
+            // Resolve destinations (and, in unicast mode, each client's channel
+            // subset). Only put anything on the wire if someone is listening.
+            let targets = dests(&params, group, source_id, &listeners, channels);
             if !targets.is_empty() {
-                match bincode::serialize(&pkt) {
-                    Ok(bytes) => {
-                        let bytes = Arc::new(bytes);
-                        // Copy 0: send now, to each destination.
-                        for d in &targets {
-                            if let Err(e) = socket.send_to(&bytes, d) {
-                                eprintln!("source '{name}': send error: {e}");
+                // Serialize once per distinct channel subset — every full-stream
+                // client and multicast share the `None` entry. Keyed by subset.
+                let mut serialized: HashMap<Option<Vec<u16>>, Arc<Vec<u8>>> = HashMap::new();
+                for (ip, port, subset) in &targets {
+                    let bytes = match serialized.get(subset) {
+                        Some(b) => b.clone(),
+                        None => {
+                            let (data, ch, ids) = match subset {
+                                None => (wire_fmt.encode(&chunk), fmt.channels, Vec::new()),
+                                Some(ids) => (
+                                    wire_fmt.encode(&select_channels(&chunk, channels, ids)),
+                                    ids.len() as u16,
+                                    ids.clone(),
+                                ),
+                            };
+                            let pkt = AudioPacket {
+                                source_id,
+                                seq,
+                                play_at_ms,
+                                sample_rate: fmt.sample_rate,
+                                channels: ch,
+                                format: wire_fmt,
+                                data,
+                                channel_ids: ids,
+                            };
+                            match bincode::serialize(&pkt) {
+                                Ok(b) => {
+                                    let b = Arc::new(b);
+                                    serialized.insert(subset.clone(), b.clone());
+                                    b
+                                }
+                                Err(e) => {
+                                    eprintln!("source '{name}': serialize error: {e}");
+                                    continue;
+                                }
                             }
                         }
-                        // Copies 1..N: same packet, spaced evenly in time between
-                        // `lead` (already sent) and `last_lead`, handed to the
-                        // retransmit thread (which re-resolves destinations at
-                        // send time). Clients dedup identical seqs for free.
-                        if copies > 1 {
-                            for k in 1..copies as u64 {
-                                let lead_k = lead as f64
-                                    - k as f64 * (lead - last_lead) as f64
-                                        / (copies as u64 - 1) as f64;
-                                let at = (play_at_ms as f64 - lead_k).round() as u64;
-                                let _ = tx.send(Copy {
-                                    at,
-                                    bytes: bytes.clone(),
-                                });
-                                metrics.record_copy_sent();
-                            }
+                    };
+                    let dest = (*ip, *port);
+                    // Copy 0: send now.
+                    if let Err(e) = socket.send_to(&bytes, dest) {
+                        eprintln!("source '{name}': send error: {e}");
+                    }
+                    // Copies 1..N: the same packet to this destination, spaced
+                    // evenly in time between `lead` (already sent) and `last_lead`,
+                    // handed to the retransmit thread. Clients dedup seqs for free.
+                    if copies > 1 {
+                        for k in 1..copies as u64 {
+                            let lead_k = lead as f64
+                                - k as f64 * (lead - last_lead) as f64 / (copies as u64 - 1) as f64;
+                            let at = (play_at_ms as f64 - lead_k).round() as u64;
+                            let _ = tx.send(Copy {
+                                at,
+                                dest,
+                                bytes: bytes.clone(),
+                            });
+                            metrics.record_copy_sent();
                         }
                     }
-                    Err(e) => eprintln!("source '{name}': serialize error: {e}"),
                 }
             }
 
@@ -363,25 +444,17 @@ pub fn run_source_stream(
             total_frames += frames_per_packet as u64;
             metrics.record_packet_sent(frames_per_packet as u64);
             metrics.set_pending_len(pending.len());
-
-            if pending.len() < samples_per_packet {
-                break; // read more before sending the next packet
-            }
         }
     }
 }
 
-/// Companion to [`run_source_stream`]: sends scheduled redundant copies at their
-/// wall-clock times from a min-heap, re-resolving destinations at send time (so
-/// unicast mode and idle-stop apply to copies too). Runs until the sender drops.
-fn run_retransmit(
-    socket: Arc<UdpSocket>,
-    group: Ipv4Addr,
-    source_id: u64,
-    params: Arc<SendParams>,
-    listeners: Arc<Listeners>,
-    rx: mpsc::Receiver<Copy>,
-) {
+/// Companion to [`run_source_stream`]: sends scheduled redundant copies to their
+/// (pre-resolved) destinations at their wall-clock times from a min-heap. Each
+/// copy is addressed at enqueue time — because a client's channel subset makes
+/// the payload per-destination — so a listener change within the short redundancy
+/// window isn't re-resolved; the next fresh packet picks it up. Runs until the
+/// sender drops.
+fn run_retransmit(socket: Arc<UdpSocket>, rx: mpsc::Receiver<Copy>) {
     let mut heap: BinaryHeap<Reverse<Copy>> = BinaryHeap::new();
     loop {
         // Send everything now due.
@@ -389,9 +462,7 @@ fn run_retransmit(
         while let Some(Reverse(top)) = heap.peek() {
             if top.at <= now {
                 let it = heap.pop().unwrap().0;
-                for d in dests(&params, group, source_id, &listeners) {
-                    let _ = socket.send_to(&it.bytes, d);
-                }
+                let _ = socket.send_to(&it.bytes, it.dest);
             } else {
                 break;
             }

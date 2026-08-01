@@ -32,6 +32,22 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<Ipv4Addr>,
     pub sources: Vec<SourceConfig>,
+    /// Run a playback client inside the server process, so the server machine can
+    /// also play a source. It appears as a normal client in the UI. Absent = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_client: Option<LocalClientConfig>,
+}
+
+/// Settings for the in-process local client (see [`Config::local_client`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalClientConfig {
+    /// Device id (defaults to a hostname-derived id, distinct from a standalone
+    /// client on the same host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Display name (defaults to the hostname).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,5 +266,23 @@ mod tests {
         assert_eq!(back.sources[0].redundancy, 3);
         assert_eq!(back.sources[0].last_lead_ms, 100);
         assert_eq!(back.sources[0].kind.type_name(), "mic");
+    }
+
+    #[test]
+    fn local_client_and_unicast_round_trip() {
+        let yaml = "\
+local_client:\n  id: server-box\n  name: Server\n\
+sources:\n  - type: sink\n    name: Multi\n    device_name: RustCast\n    channels: 6\n    unicast: true\n";
+        let cfg = serde_norway::from_str::<Config>(yaml).unwrap();
+        let lc = cfg.local_client.as_ref().expect("local_client present");
+        assert_eq!(lc.id.as_deref(), Some("server-box"));
+        assert_eq!(lc.name.as_deref(), Some("Server"));
+        assert!(cfg.sources[0].unicast);
+
+        // Survives a save/reload round-trip.
+        let out = serde_norway::to_string(&cfg).unwrap();
+        let back = serde_norway::from_str::<Config>(&out).unwrap();
+        assert_eq!(back.local_client.unwrap().id.as_deref(), Some("server-box"));
+        assert_eq!(back.sources[0].kind.type_name(), "sink");
     }
 }

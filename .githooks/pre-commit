@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Pre-commit hook mirroring the checks in .github/workflows/ci.yml:
+# rustfmt, clippy, tests, and the container build.
+#
+# Enabled via `git config core.hooksPath .githooks`.
+# Skip in a pinch with `git commit --no-verify`.
+set -euo pipefail
+
+echo "==> rustfmt"
+cargo fmt --all --check
+
+echo "==> clippy"
+cargo clippy --all-targets --all-features --locked -- -D warnings
+
+echo "==> test"
+cargo test --all-features --locked
+
+echo "==> all pre-commit checks passed"

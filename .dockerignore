@@ -1,0 +1,10 @@
+target
+.git
+.github
+.githooks
+.idea
+.vscode
+rustcast.yaml
+clients.json
+testfifo
+*.md

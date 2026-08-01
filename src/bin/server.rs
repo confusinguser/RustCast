@@ -3,28 +3,32 @@
 //! receives client telemetry (only while a web user is present), and serves the
 //! control UI.
 //!
-//! Usage: `server [config.yaml]`  (default: `rustcast.yaml`)
+//! Usage: `server [--config config.yaml]`  (default: `rustcast.yaml`)
+//! Shell completions: `server completions <bash|zsh|fish|...>`
 
-use std::collections::HashSet;
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustcast::api::{self, ControlSender, SourceControl};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
+
+use rustcast::api::{self, ControlSender};
 use rustcast::catalog::{
-    CatalogStore, auto_group, run_catalog_announcer, run_catalog_receiver, source_id,
+    CatalogStore, EntriesProvider, run_catalog_announcer, run_catalog_receiver,
+    run_catalog_responder,
 };
-use rustcast::clients::{ClientStore, mac_hex};
-use rustcast::config::{Config, SourceKind};
+use rustcast::clients::ClientStore;
+use rustcast::config::Config;
 use rustcast::metrics::{
-    ServerMetrics, TelemetryStore, run_stats_broadcaster, run_stats_receiver,
+    SamplerProvider, TelemetryStore, run_stats_broadcaster, run_stats_receiver,
     run_telemetry_receiver,
 };
-use rustcast::stream::{SendParams, run_source_stream};
+use rustcast::supervisor::SourceRegistry;
 use rustcast::sync::{Listeners, run_server_responder};
-use rustcast::wire::{CatalogEntry, DEFAULT_SYNC_PORT, WireFormat, now_epoch_ms};
+use rustcast::wire::{DEFAULT_SYNC_PORT, now_epoch_ms};
 
 /// Port for the HTTP control API + web UI.
 const HTTP_PORT: u16 = 8080;
@@ -35,22 +39,35 @@ const CLIENTS_JSON: &str = "clients.json";
 /// How often the reconciler enforces persisted settings onto clients.
 const RECONCILE_MS: u64 = 500;
 
-/// One fully-resolved source, ready to stream.
-struct Prepared {
-    id: u64,
-    cfg_index: usize,
-    name: String,
-    group: Ipv4Addr,
-    wire_fmt: WireFormat,
-    channels: u16,
-    sample_rate: u32,
-    kind: SourceKind,
-    params: Arc<SendParams>,
-    metrics: Arc<ServerMetrics>,
+/// Command-line options for the server.
+#[derive(Parser)]
+#[command(name = "server", about = "RustCast streaming server")]
+struct Cli {
+    /// Path to the YAML config file.
+    #[arg(short, long, default_value = "rustcast.yaml")]
+    config: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print a shell completion script to stdout (e.g. `completions fish`).
+    Completions { shell: Shell },
 }
 
 fn main() {
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "rustcast.yaml".into());
+    let cli = Cli::parse();
+
+    // Completion generation is a standalone mode: print the script and exit.
+    if let Some(Command::Completions { shell }) = cli.command {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return;
+    }
+
+    let config_path = cli.config;
     let config = Config::load_or_create(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to load config '{config_path}': {e}");
         exit(1);
@@ -62,82 +79,45 @@ fn main() {
     let iface = config.interface.unwrap_or(Ipv4Addr::UNSPECIFIED);
     let server_id = gen_server_id();
 
-    // Resolve every source: id, group (explicit or auto), wire format, metrics.
-    let mut prepared: Vec<Prepared> = Vec::new();
-    let mut used_groups: HashSet<Ipv4Addr> = HashSet::new();
-    for (cfg_index, s) in config.sources.iter().enumerate() {
-        let id = source_id(server_id, &s.name);
-        let mut group = s.group.unwrap_or_else(|| auto_group(id));
-        // Nudge apart any two of *our own* sources that landed on the same group.
-        while !used_groups.insert(group) {
-            let o = group.octets();
-            group = Ipv4Addr::new(o[0], o[1], o[2], o[3].wrapping_add(1));
+    // Who's listening to each source (learned from time-sync requests); gates
+    // idle sources and targets unicast mode.
+    let listeners = Arc::new(Listeners::new());
+
+    // The live source set. Spawn each configured source through it; add/remove at
+    // runtime from the web UI go through the same registry (hot-reload).
+    let registry = Arc::new(SourceRegistry::new(server_id, iface, listeners.clone()));
+    for s in &config.sources {
+        if let Err(e) = registry.spawn(s) {
+            eprintln!("source '{}': {e}", s.name);
         }
-        let wire_fmt = WireFormat::parse(s.kind.format_str()).expect("validated above");
-        let (channels, sample_rate) = nominal_format(&s.kind);
-        prepared.push(Prepared {
-            id,
-            cfg_index,
-            name: s.name.clone(),
-            group,
-            wire_fmt,
-            channels,
-            sample_rate,
-            kind: s.kind.clone(),
-            params: Arc::new(SendParams::new(
-                s.lead_ms,
-                s.redundancy,
-                s.last_lead_ms,
-                s.unicast,
-            )),
-            metrics: Arc::new(ServerMetrics::new()),
-        });
     }
 
-    // Config is shared so the API can persist send-timing edits back to the yaml.
+    // A playback client inside this process, if configured (the server machine
+    // also plays). Reaches its own server over loopback multicast.
+    let local_client = config.local_client.clone();
+
+    // Config is shared so the API can persist source + send-timing edits.
     let config = Arc::new(Mutex::new(config));
 
     // Shared state.
     let catalog_store = Arc::new(CatalogStore::new());
     let telemetry = Arc::new(TelemetryStore::new());
     let control = Arc::new(ControlSender::new(iface).expect("bind control socket"));
-    // Durable per-client settings, keyed by MAC.
+    // Durable per-client settings, keyed by device id.
     let clients_store = Arc::new(ClientStore::load(CLIENTS_JSON));
-    // Who's listening to each source (learned from time-sync requests); gates
-    // idle sources and targets unicast mode.
-    let listeners = Arc::new(Listeners::new());
 
-    // Catalog entries we advertise, each paired with its live SendParams so the
-    // announcer reports the current lead. And the UI-controllable source list.
-    let mut entries: Vec<(CatalogEntry, Arc<SendParams>)> = Vec::new();
-    let mut controls: Vec<SourceControl> = Vec::new();
-    for p in &prepared {
-        entries.push((
-            CatalogEntry {
-                source_id: p.id,
-                name: p.name.clone(),
-                source_type: p.kind.type_name().to_string(),
-                group: p.group.octets(),
-                sample_rate: p.sample_rate,
-                channels: p.channels,
-                format: p.wire_fmt,
-                lead_ms: p.params.lead() as u32,
-            },
-            p.params.clone(),
-        ));
-        controls.push(SourceControl {
-            id: p.id,
-            cfg_index: p.cfg_index,
-            params: p.params.clone(),
-        });
-    }
-    let entries = Arc::new(entries);
-    let controls = Arc::new(controls);
+    // Live providers: read the current source set fresh each time, so the
+    // announcer / stats threads reflect hot-added/removed sources.
+    let entries_provider: EntriesProvider = {
+        let r = registry.clone();
+        Arc::new(move || r.entries())
+    };
+    let sampler_provider: SamplerProvider = {
+        let r = registry.clone();
+        Arc::new(move || r.samplers())
+    };
 
-    println!(
-        "RustCast server {server_id:016x}: {} source(s), UI on http://0.0.0.0:{HTTP_PORT}",
-        prepared.len()
-    );
+    println!("RustCast server {server_id:016x}: UI on http://0.0.0.0:{HTTP_PORT}");
 
     // Always-on service threads.
     {
@@ -145,7 +125,7 @@ fn main() {
         let telemetry = telemetry.clone();
         let clients = clients_store.clone();
         let control = control.clone();
-        let controls = controls.clone();
+        let registry = registry.clone();
         let config = config.clone();
         let config_path = config_path.clone();
         std::thread::spawn(move || {
@@ -155,7 +135,7 @@ fn main() {
                 telemetry,
                 clients,
                 control,
-                controls,
+                registry,
                 config,
                 config_path,
                 HTTP_PORT,
@@ -163,22 +143,52 @@ fn main() {
         });
     }
     // Reconcile persisted settings onto clients: adopt a new client's reported
-    // values, and push the stored volume/delay to a (re)connecting client whose
-    // live values differ — this is what makes settings survive client restarts.
+    // values, and push the stored volume/delay/source to a (re)connecting client
+    // whose live values differ — this is what makes settings survive restarts.
     {
         let telemetry = telemetry.clone();
         let clients = clients_store.clone();
         let control = control.clone();
+        let registry = registry.clone();
         std::thread::spawn(move || {
+            // Clients whose stored source we've already tried to restore this
+            // session, so we don't fight the user's later selections.
+            let mut restored: std::collections::HashSet<String> = std::collections::HashSet::new();
             loop {
                 for c in telemetry.clients_summary() {
-                    let key = mac_hex(c.mac);
-                    let rec = clients.get_or_create(&key, c.volume, c.delay_ms);
+                    let rec = clients.get_or_create(&c.id, c.volume, c.delay_ms);
                     if (rec.volume - c.volume).abs() > f32::EPSILON {
                         control.send(c.ip, None, Some(rec.volume), None);
                     }
                     if rec.delay_ms != c.delay_ms {
                         control.send(c.ip, None, None, Some(rec.delay_ms));
+                    }
+                    // Restore a non-default channel map the client isn't yet using.
+                    if !rec.channel_map.is_empty() && rec.channel_map != c.channel_map {
+                        control.send_channel_map(c.ip, rec.channel_map.clone());
+                    }
+
+                    if restored.insert(c.id.clone()) {
+                        // First sight this session: restore the stored source (by
+                        // name → current id), if this server still hosts it.
+                        if let Some(name) = &rec.source
+                            && let Some(id) = registry.id_for_name(name)
+                            && c.selected_source_id != id
+                        {
+                            control.send(c.ip, Some(id), None, None);
+                        }
+                    } else {
+                        // Steady state: track what the client is playing. Store the
+                        // source name only while it's one of *ours*; None when off
+                        // or playing another server's source.
+                        let cur = if c.selected_source_id == 0 {
+                            None
+                        } else {
+                            registry.name(c.selected_source_id)
+                        };
+                        if cur != rec.source {
+                            clients.set_source_name(&c.id, cur);
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(RECONCILE_MS));
@@ -190,10 +200,15 @@ fn main() {
         std::thread::spawn(move || run_server_responder(DEFAULT_SYNC_PORT, listeners));
     }
     {
-        let entries = entries.clone();
+        let entries = entries_provider.clone();
         std::thread::spawn(move || {
             run_catalog_announcer(server_id, DEFAULT_SYNC_PORT, entries, iface)
         });
+    }
+    // Answer unicast catalog requests (for clients started with --server <ip>).
+    {
+        let entries = entries_provider.clone();
+        std::thread::spawn(move || run_catalog_responder(server_id, DEFAULT_SYNC_PORT, entries));
     }
     {
         let catalog = catalog_store.clone();
@@ -211,66 +226,38 @@ fn main() {
     }
     // Broadcast our own sources' send-path stats to other servers.
     {
-        let samplers: Vec<(u64, Arc<ServerMetrics>)> =
-            prepared.iter().map(|p| (p.id, p.metrics.clone())).collect();
+        let samplers = sampler_provider.clone();
         std::thread::spawn(move || run_stats_broadcaster(server_id, samplers, iface));
     }
     // Sample each source's send-path metrics into the history at ~10 Hz.
     {
         let telemetry = telemetry.clone();
-        let samplers: Vec<(u64, Arc<ServerMetrics>)> =
-            prepared.iter().map(|p| (p.id, p.metrics.clone())).collect();
-        std::thread::spawn(move || loop {
-            for (id, m) in &samplers {
-                telemetry.push_server(*id, m.snapshot());
+        let samplers = sampler_provider.clone();
+        std::thread::spawn(move || {
+            loop {
+                for (id, m) in samplers() {
+                    telemetry.push_server(id, m.snapshot());
+                }
+                std::thread::sleep(Duration::from_millis(SERVER_SAMPLE_MS));
             }
-            std::thread::sleep(Duration::from_millis(SERVER_SAMPLE_MS));
         });
     }
 
-    // One streaming thread per source.
-    let mut handles = Vec::new();
-    for p in prepared {
-        let listeners = listeners.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("stream-{}", p.name))
-            .spawn(move || {
-                run_source_stream(
-                    p.id, p.name, p.group, p.wire_fmt, iface, p.kind, p.params, listeners,
-                    p.metrics,
-                )
-            })
-            .expect("spawn source stream");
-        handles.push(handle);
+    // Optionally run a playback client in-process (server also plays).
+    if let Some(lc) = local_client {
+        let device_id = lc
+            .id
+            .or_else(|| Some(format!("{}-local", rustcast::client::hostname())));
+        std::thread::Builder::new()
+            .name("local-client".into())
+            .spawn(move || rustcast::client::run_client(iface, None, device_id, lc.name))
+            .expect("spawn local client");
     }
 
-    // Park: keep the process alive as long as any source stream is running.
-    for h in handles {
-        let _ = h.join();
-    }
-    eprintln!("all source streams ended; exiting.");
-}
-
-/// The nominal (channels, sample_rate) advertised for a source. Most take it
-/// from config; Spotify decodes at a fixed 44.1 kHz stereo.
-fn nominal_format(kind: &SourceKind) -> (u16, u32) {
-    match kind {
-        SourceKind::Pipe {
-            channels,
-            sample_rate,
-            ..
-        }
-        | SourceKind::Sink {
-            channels,
-            sample_rate,
-            ..
-        }
-        | SourceKind::Mic {
-            channels,
-            sample_rate,
-            ..
-        } => (*channels, *sample_rate),
-        SourceKind::Spotify { .. } => (2, 44_100),
+    // The source streams run in the registry's own threads; keep the process
+    // alive (the registry can be mutated at runtime from the web UI).
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
     }
 }
 

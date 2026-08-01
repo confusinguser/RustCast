@@ -35,3 +35,6 @@ poem = { version = "3.1.12", features = ["sse"] }
 serde_norway = "0.9"
 # JSON for the persistent per-client store (clients.json).
 serde_json = "1"
+# CLI parsing + shell-completion generation for both binaries.
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"

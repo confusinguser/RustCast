@@ -63,6 +63,20 @@
       border-radius: 6px; padding: 5px 8px; font-size: 14px;
     }
     .pct { width: 44px; text-align: right; font-variant-numeric: tabular-nums; font-size: 14px; color: #c7ccd6; }
+    .chanmap { margin-top: 10px; padding: 10px 12px; background: #12161d; border: 1px solid #222833; border-radius: 8px; }
+    .chanmap-title { font-size: 12px; color: #8b909a; margin-bottom: 8px; }
+    .chanmap-row { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+    .chanmap-row:first-of-type { margin-top: 0; }
+    .cfg { margin-top: 24px; }
+    .cfg-source { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
+    .cfg-field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #8b909a; }
+    .cfg-field input, .cfg-field select { width: 110px; background: #10131a; color: #e6e8ec; border: 1px solid #262b36; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+    .cfg-field input[type=number] { width: 72px; }
+    .cfg-addlabel { font-size: 13px; color: #c7ccd6; align-self: center; }
+    .cfg-btn { background: #22304a; color: #cfe0ff; border: 1px solid #2c3d5c; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
+    .cfg-btn.danger { background: #3a2130; color: #ffd0d8; border-color: #5c2c3a; }
+    .cfg-btn:disabled { opacity: 0.4; cursor: default; }
+    .cfg-msg { color: #8b909a; font-weight: 400; }
     .empty { color: #8b909a; text-align: center; padding: 48px 0; }
     .err { color: #ff6b6b; font-size: 13px; margin-bottom: 16px; }
 
@@ -434,14 +448,53 @@
       );
     }
 
-    function Client({ c, st, catalog, clockOffset, volume, delay, delayMax, onSource, onVolume, onDelay, onName }) {
+    // Per-output-channel routing matrix: for each of the client's output
+    // channels, pick which source channel feeds it (or silence). Only shown when
+    // the client is playing a source and its output channel count is known.
+    function ChannelMatrix({ c, catalog, onChannelMap }) {
+      const sel = c.selected_source_id;
+      if (!sel) return null;
+      const srcEntry = catalog.find((s) => s.source_id === sel);
+      const srcCh = srcEntry ? srcEntry.channels : 0;
+      const outCh = c.output_channels || 0;
+      if (!srcCh || !outCh) return null;
+
+      // Effective source channel feeding output channel `o` (identity default).
+      const eff = (o) =>
+        (c.channel_map && c.channel_map.length) ? (c.channel_map[o] ?? -1)
+                                                : (o < srcCh ? o : -1);
+      const setOne = (o, val) => {
+        const m = [];
+        for (let i = 0; i < outCh; i++) m.push(i === o ? val : eff(i));
+        onChannelMap(c.id, m);
+      };
+      return (
+        <div className="chanmap">
+          <div className="chanmap-title">Routing · {srcCh}→{outCh} ch</div>
+          {Array.from({ length: outCh }, (_, o) => (
+            <div className="chanmap-row" key={o}>
+              <span className="label">Out {o}</span>
+              <select value={eff(o)} onChange={(e) => setOne(o, Number(e.target.value))}>
+                <option value={-1}>silence</option>
+                {Array.from({ length: srcCh }, (_, s) => (
+                  <option key={s} value={s}>Src {s}</option>
+                ))}
+              </select>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function Client({ c, st, catalog, clockOffset, volume, delay, delayMax, onSource, onVolume, onDelay, onName, onChannelMap }) {
       return (
         <div className="card">
           <div className="row">
             <span className={"dot " + (c.connected ? "on" : "off")}></span>
-            <NameField mac={c.mac} name={c.name} onName={onName} />
+            <NameField mac={c.id} name={c.name} onName={onName} />
             <span className="ip">{c.ip}</span>
             <span className="meta">
+              {c.output_channels ? `${c.output_channels}ch · ` : ""}
               {c.connected ? "connected" : `last seen ${c.seconds_ago}s ago`}
             </span>
           </div>
@@ -449,7 +502,7 @@
             <span className="label">Src</span>
             {/* Driven by the client-reported selection (authoritative), not local
                 state: a pick round-trips via a control command + telemetry. */}
-            <select value={c.selected_source_id || ""} onChange={(e) => onSource(c.mac, e.target.value)}>
+            <select value={c.selected_source_id || ""} onChange={(e) => onSource(c.id, e.target.value)}>
               <option value="">Off</option>
               {catalog.map((s) => (
                 <option key={s.source_id} value={s.source_id}>
@@ -462,7 +515,7 @@
             <span className="label">Vol</span>
             <input
               type="range" min="0" max="100" value={Math.round(volume * 100)}
-              onChange={(e) => onVolume(c.mac, Number(e.target.value) / 100)}
+              onChange={(e) => onVolume(c.id, Number(e.target.value) / 100)}
             />
             <span className="pct">{Math.round(volume * 100)}%</span>
           </div>
@@ -474,10 +527,11 @@
               type="range" min="0" max={delayMax || 0} step="1"
               value={Math.min(delay, delayMax || 0)}
               disabled={!delayMax}
-              onChange={(e) => onDelay(c.mac, Number(e.target.value))}
+              onChange={(e) => onDelay(c.id, Number(e.target.value))}
             />
             <span className="pct">{delay}ms</span>
           </div>
+          <ChannelMatrix c={c} catalog={catalog} onChannelMap={onChannelMap} />
           <DeviceStats st={st} clockOffset={clockOffset} />
         </div>
       );
@@ -493,6 +547,130 @@
           body: JSON.stringify(body),
         }).catch(() => {});
       }, []);
+    }
+
+    // ---- server config editor (add / edit / remove sources, hot-reloaded) ----
+
+    const NEW_SOURCE = {
+      pipe: { type: "pipe", name: "", path: "", format: "s16", channels: 2, sample_rate: 44100 },
+      spotify: { type: "spotify", name: "", device_name: "RustCast", format: "f32" },
+      sink: { type: "sink", name: "", device_name: "RustCast", format: "s16", channels: 2, sample_rate: 44100 },
+      mic: { type: "mic", name: "", device: "", format: "s16", channels: 2, sample_rate: 44100 },
+    };
+
+    // Type-specific fields for one source (used for both existing rows + the add
+    // form); `on(key, value)` updates the owning object.
+    function SourceFields({ s, on }) {
+      const fmt = (
+        <label className="cfg-field">fmt
+          <select value={s.format ?? "s16"} onChange={(e) => on("format", e.target.value)}>
+            <option value="s16">s16</option><option value="f32">f32</option>
+          </select>
+        </label>
+      );
+      const nums = (
+        <React.Fragment>
+          <label className="cfg-field">ch<input type="number" min="1" value={s.channels ?? 2}
+            onChange={(e) => on("channels", Number(e.target.value))} /></label>
+          <label className="cfg-field">rate<input type="number" value={s.sample_rate ?? 44100}
+            onChange={(e) => on("sample_rate", Number(e.target.value))} /></label>
+        </React.Fragment>
+      );
+      if (s.type === "pipe") return (<React.Fragment>
+        <label className="cfg-field">path<input value={s.path ?? ""} onChange={(e) => on("path", e.target.value)} /></label>
+        {fmt}{nums}
+      </React.Fragment>);
+      if (s.type === "spotify") return (<React.Fragment>
+        <label className="cfg-field">device<input value={s.device_name ?? ""} onChange={(e) => on("device_name", e.target.value)} /></label>
+        {fmt}
+      </React.Fragment>);
+      if (s.type === "sink") return (<React.Fragment>
+        <label className="cfg-field">device<input value={s.device_name ?? ""} onChange={(e) => on("device_name", e.target.value)} /></label>
+        {fmt}{nums}
+      </React.Fragment>);
+      if (s.type === "mic") return (<React.Fragment>
+        <label className="cfg-field">device<input value={s.device ?? ""} onChange={(e) => on("device", e.target.value)} /></label>
+        {fmt}{nums}
+      </React.Fragment>);
+      return null;
+    }
+
+    function TypeSelect({ value, onChange }) {
+      return (
+        <label className="cfg-field">type
+          <select value={value} onChange={(e) => onChange(e.target.value)}>
+            <option value="pipe">pipe</option><option value="spotify">spotify</option>
+            <option value="sink">sink</option><option value="mic">mic</option>
+          </select>
+        </label>
+      );
+    }
+
+    function ConfigEditor() {
+      const [sources, setSources] = useState(null);
+      const [addType, setAddType] = useState("pipe");
+      const [draft, setDraft] = useState(NEW_SOURCE.pipe);
+      const [msg, setMsg] = useState("");
+
+      const load = useCallback(() => {
+        fetch("/api/config").then((r) => r.json())
+          .then((c) => setSources(c.sources || [])).catch(() => setSources([]));
+      }, []);
+      useEffect(() => { load(); }, [load]);
+
+      // Edit an existing (fetched) source in place. Switching type resets to that
+      // type's template but keeps the name + id.
+      const setField = (idx, key, val) => {
+        setSources((prev) => prev.map((s, i) => {
+          if (i !== idx) return s;
+          if (key === "type") return { ...NEW_SOURCE[val], name: s.name, id: s.id };
+          return { ...s, [key]: val };
+        }));
+      };
+      const save = (s) => {
+        const { id, ...body } = s; // id is in the URL, not the body
+        fetch(`/api/sources/${id}`, {
+          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        }).then((r) => r.ok ? (setMsg(`saved '${s.name}'`), load()) : r.text().then((t) => setMsg(t)))
+          .catch(() => setMsg("network error"));
+      };
+      const del = (s) => {
+        fetch(`/api/sources/${s.id}`, { method: "DELETE" }).then(() => load()).catch(() => {});
+      };
+      const setDraftField = (key, val) => {
+        if (key === "type") { setAddType(val); setDraft({ ...NEW_SOURCE[val], name: draft.name }); }
+        else setDraft((d) => ({ ...d, [key]: val }));
+      };
+      const add = () => {
+        fetch("/api/sources", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(draft),
+        }).then((r) => r.ok ? (setMsg(`added '${draft.name}'`), setDraft(NEW_SOURCE[addType]), load())
+                            : r.text().then((t) => setMsg(t)))
+          .catch(() => setMsg("network error"));
+      };
+
+      if (sources === null) return null;
+      return (
+        <section className="cfg">
+          <div className="sectitle">Server config{msg && <span className="cfg-msg"> · {msg}</span>}</div>
+          {sources.map((s, idx) => (
+            <div className="card cfg-source" key={s.id}>
+              <label className="cfg-field">name<input value={s.name ?? ""} onChange={(e) => setField(idx, "name", e.target.value)} /></label>
+              <TypeSelect value={s.type} onChange={(v) => setField(idx, "type", v)} />
+              <SourceFields s={s} on={(k, v) => setField(idx, k, v)} />
+              <button className="cfg-btn" onClick={() => save(s)}>Save</button>
+              <button className="cfg-btn danger" onClick={() => del(s)}>Delete</button>
+            </div>
+          ))}
+          <div className="card cfg-source cfg-add">
+            <span className="cfg-addlabel">Add</span>
+            <label className="cfg-field">name<input value={draft.name} onChange={(e) => setDraftField("name", e.target.value)} /></label>
+            <TypeSelect value={addType} onChange={(v) => setDraftField("type", v)} />
+            <SourceFields s={draft} on={setDraftField} />
+            <button className="cfg-btn" onClick={add} disabled={!draft.name}>Add source</button>
+          </div>
+        </section>
+      );
     }
 
     function App() {
@@ -525,11 +703,11 @@
             if (e.samples.length > 600) e.samples.splice(0, e.samples.length - 600);
           };
           for (const s of (msg.server || [])) roll(h.server, s.source_id, s);
-          for (const c of (msg.clients_hist || [])) roll(h.clients, c.mac, c);
+          for (const c of (msg.clients_hist || [])) roll(h.clients, c.id, c);
           // Drop entities no longer present so stale cards disappear.
           const liveSrc = new Set((msg.server || []).map((s) => s.source_id));
           for (const k of Object.keys(h.server)) if (!liveSrc.has(k)) delete h.server[k];
-          const liveCli = new Set((msg.clients_hist || []).map((c) => c.mac));
+          const liveCli = new Set((msg.clients_hist || []).map((c) => c.id));
           for (const k of Object.keys(h.clients)) if (!liveCli.has(k)) delete h.clients[k];
 
           setClients(msg.clients || []);
@@ -570,6 +748,7 @@
         putSetting(mac, "delay", { delay_ms: ms });
       };
       const onName = (mac, name) => putSetting(mac, "name", { name: name || null });
+      const onChannelMap = (id, map) => putSetting(id, "channelmap", { map });
       // Send-timing edit: optimistic local state + PUT to the source endpoint.
       const onSend = (id, patch) => {
         setSendParams((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
@@ -581,8 +760,8 @@
       };
 
       // Index telemetry by MAC so each card can find its own history.
-      const statsByMac = {};
-      if (stats) for (const cs of stats.clients) statsByMac[cs.mac] = cs;
+      const statsById = {};
+      if (stats) for (const cs of stats.clients) statsById[cs.id] = cs;
       const sources = stats ? (stats.server || []) : [];
       // Catalog lead per source id → a client's delay cap when it plays that source.
       const leadById = {};
@@ -615,15 +794,17 @@
               )}
               {clients.map((c) => (
                 <Client
-                  key={c.mac} c={c} st={statsByMac[c.mac]} catalog={catalog} clockOffset={clockOffset}
-                  volume={volumes[c.mac] ?? c.volume}
-                  delay={delays[c.mac] ?? c.delay_ms}
+                  key={c.id} c={c} st={statsById[c.id]} catalog={catalog} clockOffset={clockOffset}
+                  volume={volumes[c.id] ?? c.volume}
+                  delay={delays[c.id] ?? c.delay_ms}
                   delayMax={leadById[c.selected_source_id]}
                   onSource={onSource} onVolume={onVolume} onDelay={onDelay} onName={onName}
+                  onChannelMap={onChannelMap}
                 />
               ))}
             </section>
           </div>
+          <ConfigEditor />
         </div>
       );
     }

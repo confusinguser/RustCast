@@ -21,6 +21,14 @@ pub struct ClientRecord {
     pub name: Option<String>,
     pub volume: f32,
     pub delay_ms: u32,
+    /// Output channel map (one source-channel index per output channel, `-1` =
+    /// silence). Empty = default identity mapping.
+    #[serde(default)]
+    pub channel_map: Vec<i16>,
+    /// Name of the source this client last played *on this server* (restored on
+    /// reconnect). `None` when off or playing another server's source.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl Default for ClientRecord {
@@ -29,6 +37,8 @@ impl Default for ClientRecord {
             name: None,
             volume: 1.0,
             delay_ms: 0,
+            channel_map: Vec::new(),
+            source: None,
         }
     }
 }
@@ -70,6 +80,8 @@ impl ClientStore {
             name: None,
             volume,
             delay_ms: delay_ms.min(MAX_DELAY_MS),
+            channel_map: Vec::new(),
+            source: None,
         };
         map.insert(mac.to_string(), rec.clone());
         self.save(&map);
@@ -88,11 +100,25 @@ impl ClientStore {
         self.save(&map);
     }
 
+    /// Set (or clear) the name of the source this client is playing on this
+    /// server, so it can be restored on reconnect.
+    pub fn set_source_name(&self, mac: &str, source: Option<String>) {
+        let mut m = self.inner.lock().unwrap();
+        m.entry(mac.to_string()).or_default().source = source;
+        self.save(&m);
+    }
+
+    /// Set the output channel map (one source-channel index per output channel).
+    pub fn set_channel_map(&self, mac: &str, map: Vec<i16>) {
+        let mut m = self.inner.lock().unwrap();
+        m.entry(mac.to_string()).or_default().channel_map = map;
+        self.save(&m);
+    }
+
     /// Set (or, with `None`/empty, clear) the display-name override.
     pub fn set_name(&self, mac: &str, name: Option<String>) {
         let mut map = self.inner.lock().unwrap();
-        map.entry(mac.to_string()).or_default().name =
-            name.filter(|s| !s.trim().is_empty());
+        map.entry(mac.to_string()).or_default().name = name.filter(|s| !s.trim().is_empty());
         self.save(&map);
     }
 

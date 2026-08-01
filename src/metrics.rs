@@ -57,6 +57,8 @@ pub struct DeviceMetrics {
     jitter_buffer_len: AtomicU32,
     sample_rate: AtomicU32,
     channels: AtomicU32,
+    /// Channels on the local output device (fixed at startup).
+    output_channels: AtomicU32,
     // Clock-sync state (f64 stored as bits since there is no AtomicF64).
     clock_offset_bits: AtomicU64,
     clock_target_bits: AtomicU64,
@@ -76,6 +78,17 @@ impl DeviceMetrics {
     pub fn set_format(&self, sample_rate: u32, channels: u16) {
         self.sample_rate.store(sample_rate, Ordering::Relaxed);
         self.channels.store(channels as u32, Ordering::Relaxed);
+    }
+
+    /// Record the output device's channel count (set once at startup).
+    pub fn set_output_channels(&self, channels: u16) {
+        self.output_channels
+            .store(channels as u32, Ordering::Relaxed);
+    }
+
+    /// The output device's channel count, for building the default channel map.
+    pub fn output_channels(&self) -> u16 {
+        self.output_channels.load(Ordering::Relaxed) as u16
     }
 
     /// One block of `samples` interleaved values handed to the player.
@@ -147,13 +160,16 @@ impl DeviceMetrics {
     pub fn snapshot(&self) -> TelemetryReport {
         TelemetryReport {
             sent_ms: now_epoch_ms(),
+            device_id: String::new(),
             mac: [0; 6],
             hostname: String::new(),
             sample_rate: self.sample_rate.load(Ordering::Relaxed),
             channels: self.channels.load(Ordering::Relaxed) as u16,
+            output_channels: self.output_channels.load(Ordering::Relaxed) as u16,
             selected_source_id: 0,
             volume: 0.0,
             delay_ms: 0,
+            channel_map: Vec::new(),
             blocks_appended: self.blocks_appended.load(Ordering::Relaxed),
             samples_appended: self.samples_appended.load(Ordering::Relaxed),
             packets_received: self.packets_received.load(Ordering::Relaxed),
@@ -187,6 +203,7 @@ fn frame(bytes: &[u8]) -> Vec<u8> {
 pub fn run_telemetry_sender(
     settings: Arc<ClientSettings>,
     metrics: Arc<DeviceMetrics>,
+    device_id: String,
     mac: [u8; 6],
     hostname: String,
     catalog: Arc<CatalogStore>,
@@ -200,6 +217,8 @@ pub fn run_telemetry_sender(
         report.selected_source_id = sel;
         report.volume = vol;
         report.delay_ms = delay;
+        report.channel_map = settings.channel_map();
+        report.device_id = device_id.clone();
         report.mac = mac;
         report.hostname = hostname.clone();
 
@@ -209,22 +228,22 @@ pub fn run_telemetry_sender(
             // Drop connections to servers that vanished from the catalog.
             conns.retain(|ip, _| servers.contains(ip));
             for ip in servers {
-                if !conns.contains_key(&ip) {
+                if let std::collections::hash_map::Entry::Vacant(e) = conns.entry(ip) {
                     match TcpStream::connect_timeout(
                         &SocketAddr::from((ip, TELEMETRY_PORT)),
                         Duration::from_millis(500),
                     ) {
                         Ok(c) => {
                             let _ = c.set_nodelay(true);
-                            conns.insert(ip, c);
+                            e.insert(c);
                         }
                         Err(_) => continue, // retry next tick
                     }
                 }
-                if let Some(c) = conns.get_mut(&ip) {
-                    if c.write_all(&framed).is_err() {
-                        conns.remove(&ip); // reconnect next tick
-                    }
+                if let Some(c) = conns.get_mut(&ip)
+                    && c.write_all(&framed).is_err()
+                {
+                    conns.remove(&ip); // reconnect next tick
                 }
             }
         }
@@ -340,6 +359,7 @@ struct ClientHistory {
     samples: VecDeque<ClientSample>,
     sample_rate: u32,
     channels: u16,
+    output_channels: u16,
     last_report_ms: u64,
     /// Highest client-clock send time seen, to drop out-of-order/duplicate
     /// reports (multicast can deliver in bursts / reorder).
@@ -352,13 +372,14 @@ struct ClientHistory {
     volume: f32,
     delay_ms: u32,
     selected_source_id: u64,
+    channel_map: Vec<i16>,
 }
 
 /// Per-device stats emitted to the UI: the recent history window plus context.
-/// Keyed by MAC so the UI can match it to the client list.
+/// Keyed by device id so the UI can match it to the client list.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientStats {
-    pub mac: String,
+    pub id: String,
     pub sample_rate: u32,
     pub channels: u16,
     pub seconds_ago: f64,
@@ -409,7 +430,7 @@ pub struct StatsSnapshot {
 
 /// A client's latest state for the `/api/clients` list (not the graph history).
 pub struct ClientSummary {
-    pub mac: [u8; 6],
+    pub id: String,
     pub ip: Ipv4Addr,
     pub hostname: String,
     pub seconds_ago: f64,
@@ -417,14 +438,16 @@ pub struct ClientSummary {
     pub volume: f32,
     pub delay_ms: u32,
     pub selected_source_id: u64,
+    pub output_channels: u16,
+    pub channel_map: Vec<i16>,
 }
 
 /// Server-side ring buffers of recent telemetry, keyed by client IP, plus the
 /// per-source server send-path history. Fed by the telemetry receiver and a
 /// periodic server-metrics sampler; read by the HTTP `/api/*` handlers.
 pub struct TelemetryStore {
-    /// Keyed by client MAC (stable across IP changes / restarts).
-    clients: Mutex<HashMap<[u8; 6], ClientHistory>>,
+    /// Keyed by client device id (the `--id` value, else MAC hex).
+    clients: Mutex<HashMap<String, ClientHistory>>,
     server_hist: Mutex<HashMap<u64, VecDeque<ServerSample>>>,
 }
 
@@ -440,18 +463,22 @@ impl TelemetryStore {
     /// client's MAC.
     pub fn push_client(&self, ip: Ipv4Addr, report: TelemetryReport, recv_ms: u64) {
         let mut map = self.clients.lock().unwrap();
-        let hist = map.entry(report.mac).or_insert_with(|| ClientHistory {
-            samples: VecDeque::new(),
-            sample_rate: report.sample_rate,
-            channels: report.channels,
-            last_report_ms: recv_ms,
-            last_sent_ms: 0,
-            ip,
-            hostname: report.hostname.clone(),
-            volume: report.volume,
-            delay_ms: report.delay_ms,
-            selected_source_id: report.selected_source_id,
-        });
+        let hist = map
+            .entry(report.device_id.clone())
+            .or_insert_with(|| ClientHistory {
+                samples: VecDeque::new(),
+                sample_rate: report.sample_rate,
+                channels: report.channels,
+                output_channels: report.output_channels,
+                last_report_ms: recv_ms,
+                last_sent_ms: 0,
+                ip,
+                hostname: report.hostname.clone(),
+                volume: report.volume,
+                delay_ms: report.delay_ms,
+                selected_source_id: report.selected_source_id,
+                channel_map: report.channel_map.clone(),
+            });
         // Drop reordered/duplicate reports so the graph x-axis stays monotonic.
         if report.sent_ms <= hist.last_sent_ms {
             return;
@@ -464,12 +491,14 @@ impl TelemetryStore {
         let disp_t = (report.sent_ms as f64 + report.clock_offset_ms).max(0.0) as u64;
         hist.sample_rate = report.sample_rate;
         hist.channels = report.channels;
+        hist.output_channels = report.output_channels;
         hist.last_report_ms = recv_ms;
         hist.ip = ip;
         hist.hostname = report.hostname.clone();
         hist.volume = report.volume;
         hist.delay_ms = report.delay_ms;
         hist.selected_source_id = report.selected_source_id;
+        hist.channel_map = report.channel_map.clone();
         hist.samples.push_back(ClientSample {
             t: disp_t,
             blocks_appended: report.blocks_appended,
@@ -510,10 +539,10 @@ impl TelemetryStore {
         map.retain(|_, h| (now.saturating_sub(h.last_report_ms) as f64) / 1000.0 < STALE_SECS);
         let mut out: Vec<ClientSummary> = map
             .iter()
-            .map(|(mac, h)| {
+            .map(|(id, h)| {
                 let secs = (now.saturating_sub(h.last_report_ms) as f64) / 1000.0;
                 ClientSummary {
-                    mac: *mac,
+                    id: id.clone(),
                     ip: h.ip,
                     hostname: h.hostname.clone(),
                     seconds_ago: secs,
@@ -521,17 +550,19 @@ impl TelemetryStore {
                     volume: h.volume,
                     delay_ms: h.delay_ms,
                     selected_source_id: h.selected_source_id,
+                    output_channels: h.output_channels,
+                    channel_map: h.channel_map.clone(),
                 }
             })
             .collect();
-        out.sort_by_key(|c| c.mac);
+        out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
 
-    /// The current IP of the client with this MAC, if known — used to target
-    /// control commands (which address clients by IP).
-    pub fn ip_for_mac(&self, mac: [u8; 6]) -> Option<Ipv4Addr> {
-        self.clients.lock().unwrap().get(&mac).map(|h| h.ip)
+    /// The current IP of the client with this device id, if known — used to
+    /// target control commands (which address clients by IP).
+    pub fn ip_for_id(&self, id: &str) -> Option<Ipv4Addr> {
+        self.clients.lock().unwrap().get(id).map(|h| h.ip)
     }
 
     /// Build the `/api/stats` payload for the given sources (local + remote,
@@ -565,15 +596,15 @@ impl TelemetryStore {
         map.retain(|_, h| (now.saturating_sub(h.last_report_ms) as f64) / 1000.0 < STALE_SECS);
         let mut clients: Vec<ClientStats> = map
             .iter()
-            .map(|(mac, h)| ClientStats {
-                mac: crate::clients::mac_hex(*mac),
+            .map(|(id, h)| ClientStats {
+                id: id.clone(),
                 sample_rate: h.sample_rate,
                 channels: h.channels,
                 seconds_ago: (now.saturating_sub(h.last_report_ms) as f64) / 1000.0,
                 samples: h.samples.iter().copied().collect(),
             })
             .collect();
-        clients.sort_by(|a, b| a.mac.cmp(&b.mac));
+        clients.sort_by(|a, b| a.id.cmp(&b.id));
 
         StatsSnapshot {
             now_ms: now,
@@ -640,13 +671,13 @@ fn handle_telemetry_conn(mut stream: TcpStream, store: Arc<TelemetryStore>) {
 /// How often a server broadcasts its send-path stats to other servers.
 const STATS_BROADCAST_MS: u64 = 250;
 
+/// Supplies the current `(source_id, metrics)` pairs, read fresh each tick so a
+/// hot-added/removed source is reflected without a restart.
+pub type SamplerProvider = Arc<dyn Fn() -> Vec<(u64, Arc<ServerMetrics>)> + Send + Sync>;
+
 /// Server: broadcast this server's per-source send-path stats on [`STATS_GROUP`]
 /// at ~4 Hz, so any server's UI can graph these streams. Runs forever.
-pub fn run_stats_broadcaster(
-    server_id: u64,
-    sources: Vec<(u64, Arc<ServerMetrics>)>,
-    iface: Ipv4Addr,
-) {
+pub fn run_stats_broadcaster(server_id: u64, sources: SamplerProvider, iface: Ipv4Addr) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(s) => s,
         Err(e) => {
@@ -661,7 +692,7 @@ pub fn run_stats_broadcaster(
     }
     let dest = (STATS_GROUP, STATS_PORT);
     loop {
-        let stats: Vec<SourceStat> = sources
+        let stats: Vec<SourceStat> = sources()
             .iter()
             .map(|(id, m)| {
                 let s = m.snapshot();

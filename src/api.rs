@@ -12,15 +12,15 @@ use poem::http::StatusCode;
 use poem::listener::TcpListener;
 use poem::web::sse::{Event, SSE};
 use poem::web::{Data, Html, Json, Path};
-use poem::{EndpointExt, Route, Server, get, handler, put};
+use poem::{EndpointExt, Route, Server, get, handler, post, put};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogStore;
-use crate::clients::{ClientStore, mac_hex, parse_mac_hex};
-use crate::config::Config;
+use crate::clients::ClientStore;
+use crate::config::{Config, SourceConfig};
 use crate::metrics::{SourceMeta, TelemetryStore};
 use crate::net::set_multicast_if;
-use crate::stream::SendParams;
+use crate::supervisor::SourceRegistry;
 use crate::wire::{CONTROL_GROUP, CONTROL_PORT, ControlCommand, MAX_LEAD_MS, WireFormat};
 
 /// The single-page UI, compiled into the binary.
@@ -65,8 +65,27 @@ impl ControlSender {
             set_source_id: source_id,
             set_volume: volume,
             set_delay_ms: delay_ms,
+            set_channel_map: None,
         };
-        if let Ok(bytes) = bincode::serialize(&cmd) {
+        self.emit(&cmd);
+    }
+
+    /// Multicast a channel-map change to one client.
+    pub fn send_channel_map(&self, target: Ipv4Addr, map: Vec<i16>) {
+        let cmd = ControlCommand {
+            target_ip: target.octets(),
+            cmd_id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            set_source_id: None,
+            set_volume: None,
+            set_delay_ms: None,
+            set_channel_map: Some(map),
+        };
+        self.emit(&cmd);
+    }
+
+    /// Serialize and multicast a command a few times (multicast is lossy).
+    fn emit(&self, cmd: &ControlCommand) {
+        if let Ok(bytes) = bincode::serialize(cmd) {
             for _ in 0..3 {
                 let _ = self.sock.send_to(&bytes, (CONTROL_GROUP, CONTROL_PORT));
             }
@@ -84,8 +103,9 @@ fn format_str(f: WireFormat) -> &'static str {
 
 #[derive(Serialize)]
 struct ClientDto {
-    /// Stable identity, colon hex; the UI keys and addresses clients by this.
-    mac: String,
+    /// Stable identity (the `--id` value, else MAC hex); the UI keys and
+    /// addresses clients by this.
+    id: String,
     ip: String,
     /// Display name: the override from clients.json, else the device hostname.
     name: String,
@@ -95,6 +115,11 @@ struct ClientDto {
     delay_ms: u32,
     /// Selected source id as a string; "" means off. (u64 exceeds JS safe ints.)
     selected_source_id: String,
+    /// Output device channel count (for the routing matrix).
+    output_channels: u16,
+    /// Current output channel map (one source-channel index per output channel,
+    /// `-1` = silence). Empty = default identity mapping.
+    channel_map: Vec<i16>,
 }
 
 #[derive(Serialize)]
@@ -133,6 +158,12 @@ struct NameBody {
 }
 
 #[derive(Deserialize)]
+struct ChannelMapBody {
+    /// One source-channel index per output channel (`-1` = silence).
+    map: Vec<i16>,
+}
+
+#[derive(Deserialize)]
 struct SendBody {
     /// Any subset; omitted fields are left unchanged.
     #[serde(default)]
@@ -143,14 +174,6 @@ struct SendBody {
     last_lead_ms: Option<u64>,
     #[serde(default)]
     unicast: Option<bool>,
-}
-
-/// A local source the UI can control the send timing of.
-pub struct SourceControl {
-    pub id: u64,
-    /// Index into `Config::sources`, for persisting edits back to the yaml.
-    pub cfg_index: usize,
-    pub params: Arc<SendParams>,
 }
 
 #[handler]
@@ -164,14 +187,13 @@ fn client_dtos(store: &TelemetryStore, clients_store: &ClientStore) -> Vec<Clien
         .clients_summary()
         .into_iter()
         .map(|c| {
-            let mac = mac_hex(c.mac);
             // Display name: stored override, else the reported hostname.
             let name = clients_store
-                .get(&mac)
+                .get(&c.id)
                 .and_then(|r| r.name)
                 .unwrap_or(c.hostname);
             ClientDto {
-                mac,
+                id: c.id,
                 ip: c.ip.to_string(),
                 name,
                 seconds_ago: (c.seconds_ago * 10.0).round() / 10.0,
@@ -183,6 +205,8 @@ fn client_dtos(store: &TelemetryStore, clients_store: &ClientStore) -> Vec<Clien
                 } else {
                     c.selected_source_id.to_string()
                 },
+                output_channels: c.output_channels,
+                channel_map: c.channel_map,
             }
         })
         .collect()
@@ -206,21 +230,21 @@ fn catalog_dtos(catalog: &CatalogStore) -> Vec<SourceDto> {
 }
 
 /// Send-path source metadata (local + remote), for the per-source cards.
-fn source_metas(catalog: &CatalogStore, controls: &[SourceControl], my_id: u64) -> Vec<SourceMeta> {
+fn source_metas(catalog: &CatalogStore, registry: &SourceRegistry, my_id: u64) -> Vec<SourceMeta> {
     catalog
         .snapshot()
         .into_iter()
         .map(|r| {
-            let local = controls.iter().find(|c| c.id == r.entry.source_id);
+            let local = registry.params(r.entry.source_id);
             SourceMeta {
                 id: r.entry.source_id,
                 name: r.entry.name,
                 sample_rate: r.entry.sample_rate,
                 channels: r.entry.channels,
                 lead_ms: r.entry.lead_ms,
-                redundancy: local.map(|c| c.params.redundancy()).unwrap_or(0),
-                last_lead_ms: local.map(|c| c.params.last_lead()).unwrap_or(0),
-                unicast: local.map(|c| c.params.unicast()).unwrap_or(false),
+                redundancy: local.as_ref().map(|p| p.redundancy()).unwrap_or(0),
+                last_lead_ms: local.as_ref().map(|p| p.last_lead()).unwrap_or(0),
+                unicast: local.as_ref().map(|p| p.unicast()).unwrap_or(false),
                 remote: r.server_id != my_id,
             }
         })
@@ -253,17 +277,17 @@ fn events(
     Data(store): Data<&Arc<TelemetryStore>>,
     Data(catalog): Data<&Arc<CatalogStore>>,
     Data(clients_store): Data<&Arc<ClientStore>>,
-    Data(controls): Data<&Arc<Vec<SourceControl>>>,
+    Data(registry): Data<&Arc<SourceRegistry>>,
     Data(sid): Data<&Arc<LocalServerId>>,
 ) -> SSE {
     struct St {
         store: Arc<TelemetryStore>,
         catalog: Arc<CatalogStore>,
         clients_store: Arc<ClientStore>,
-        controls: Arc<Vec<SourceControl>>,
+        registry: Arc<SourceRegistry>,
         my_id: u64,
         first: bool,
-        // cursors: highest sample `t` already sent, per source id / per client mac.
+        // cursors: highest sample `t` already sent, per source id / per client id.
         server_cur: std::collections::HashMap<String, u64>,
         client_cur: std::collections::HashMap<String, u64>,
     }
@@ -271,7 +295,7 @@ fn events(
         store: store.clone(),
         catalog: catalog.clone(),
         clients_store: clients_store.clone(),
-        controls: controls.clone(),
+        registry: registry.clone(),
         my_id: sid.0,
         first: true,
         server_cur: std::collections::HashMap::new(),
@@ -282,7 +306,7 @@ fn events(
         if !st.first {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        let metas = source_metas(&st.catalog, &st.controls, st.my_id);
+        let metas = source_metas(&st.catalog, &st.registry, st.my_id);
         let snap = st.store.snapshot(&metas); // full histories
 
         // Keep only samples past each cursor, then advance the cursors.
@@ -296,7 +320,7 @@ fn events(
         }
         let mut clients_hist = snap.clients;
         for c in &mut clients_hist {
-            let cur = st.client_cur.entry(c.mac.clone()).or_insert(0);
+            let cur = st.client_cur.entry(c.id.clone()).or_insert(0);
             c.samples.retain(|x| x.t > *cur);
             if let Some(last) = c.samples.last() {
                 *cur = last.t;
@@ -319,24 +343,17 @@ fn events(
     SSE::new(stream).keep_alive(std::time::Duration::from_secs(15))
 }
 
-/// Parse a MAC path param into its normalized key form.
-fn mac_key(mac: &str) -> poem::Result<[u8; 6]> {
-    parse_mac_hex(mac).ok_or_else(|| poem::Error::from_status(StatusCode::BAD_REQUEST))
-}
-
 #[handler]
 fn set_volume(
-    Path(mac): Path<String>,
+    Path(id): Path<String>,
     Data(store): Data<&Arc<TelemetryStore>>,
     Data(clients_store): Data<&Arc<ClientStore>>,
     Data(control): Data<&Arc<ControlSender>>,
     Json(body): Json<VolumeBody>,
 ) -> poem::Result<StatusCode> {
-    let m = mac_key(&mac)?;
-    let key = mac_hex(m);
     let v = body.volume.clamp(0.0, 1.0);
-    clients_store.set_volume(&key, v); // persist (authoritative)
-    if let Some(ip) = store.ip_for_mac(m) {
+    clients_store.set_volume(&id, v); // persist (authoritative)
+    if let Some(ip) = store.ip_for_id(&id) {
         control.send(ip, None, Some(v), None); // push to the client now
     }
     Ok(StatusCode::OK)
@@ -344,18 +361,16 @@ fn set_volume(
 
 #[handler]
 fn set_delay(
-    Path(mac): Path<String>,
+    Path(id): Path<String>,
     Data(store): Data<&Arc<TelemetryStore>>,
     Data(clients_store): Data<&Arc<ClientStore>>,
     Data(control): Data<&Arc<ControlSender>>,
     Json(body): Json<DelayBody>,
 ) -> poem::Result<StatusCode> {
-    let m = mac_key(&mac)?;
-    let key = mac_hex(m);
     // Sanity ceiling only; the client re-clamps to its selected source's lead.
     let d = body.delay_ms.min(MAX_LEAD_MS as u32);
-    clients_store.set_delay(&key, d);
-    if let Some(ip) = store.ip_for_mac(m) {
+    clients_store.set_delay(&id, d);
+    if let Some(ip) = store.ip_for_id(&id) {
         control.send(ip, None, None, Some(d));
     }
     Ok(StatusCode::OK)
@@ -363,34 +378,46 @@ fn set_delay(
 
 #[handler]
 fn set_source(
-    Path(mac): Path<String>,
+    Path(id): Path<String>,
     Data(store): Data<&Arc<TelemetryStore>>,
     Data(control): Data<&Arc<ControlSender>>,
     Json(body): Json<SourceBody>,
 ) -> poem::Result<StatusCode> {
-    let m = mac_key(&mac)?;
-    // Empty / null / absent => Off (0). Source selection is not persisted (ids
-    // change when a server restarts).
-    let id: u64 = match body.source_id.as_deref() {
+    // Empty / null / absent => Off (0).
+    let source_id: u64 = match body.source_id.as_deref() {
         None | Some("") => 0,
         Some(s) => s
             .parse()
             .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?,
     };
-    if let Some(ip) = store.ip_for_mac(m) {
-        control.send(ip, Some(id), None, None);
+    if let Some(ip) = store.ip_for_id(&id) {
+        control.send(ip, Some(source_id), None, None);
     }
     Ok(StatusCode::OK)
 }
 
 #[handler]
 fn set_name(
-    Path(mac): Path<String>,
+    Path(id): Path<String>,
     Data(clients_store): Data<&Arc<ClientStore>>,
     Json(body): Json<NameBody>,
 ) -> poem::Result<StatusCode> {
-    let key = mac_hex(mac_key(&mac)?);
-    clients_store.set_name(&key, body.name);
+    clients_store.set_name(&id, body.name);
+    Ok(StatusCode::OK)
+}
+
+#[handler]
+fn set_channel_map(
+    Path(id): Path<String>,
+    Data(store): Data<&Arc<TelemetryStore>>,
+    Data(clients_store): Data<&Arc<ClientStore>>,
+    Data(control): Data<&Arc<ControlSender>>,
+    Json(body): Json<ChannelMapBody>,
+) -> poem::Result<StatusCode> {
+    clients_store.set_channel_map(&id, body.map.clone()); // persist (authoritative)
+    if let Some(ip) = store.ip_for_id(&id) {
+        control.send_channel_map(ip, body.map); // push to the client now
+    }
     Ok(StatusCode::OK)
 }
 
@@ -400,7 +427,7 @@ fn set_name(
 #[handler]
 fn set_send(
     Path(id): Path<String>,
-    Data(controls): Data<&Arc<Vec<SourceControl>>>,
+    Data(registry): Data<&Arc<SourceRegistry>>,
     Data(config): Data<&Arc<Mutex<Config>>>,
     Data(cfg_path): Data<&Arc<String>>,
     Json(body): Json<SendBody>,
@@ -408,35 +435,116 @@ fn set_send(
     let id: u64 = id
         .parse()
         .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?;
-    let ctl = controls
-        .iter()
-        .find(|c| c.id == id)
+    let params = registry
+        .params(id)
         .ok_or_else(|| poem::Error::from_status(StatusCode::NOT_FOUND))?;
     if let Some(v) = body.lead_ms {
-        ctl.params.set_lead(v);
+        params.set_lead(v);
     }
     if let Some(v) = body.redundancy {
-        ctl.params.set_redundancy(v);
+        params.set_redundancy(v);
     }
     if let Some(v) = body.last_lead_ms {
-        ctl.params.set_last_lead(v);
+        params.set_last_lead(v);
     }
     if let Some(v) = body.unicast {
-        ctl.params.set_unicast(v);
+        params.set_unicast(v);
     }
-    // Persist the (clamped) live values back to the config file.
-    {
-        let mut cfg = config.lock().unwrap();
-        if let Some(sc) = cfg.sources.get_mut(ctl.cfg_index) {
-            sc.lead_ms = ctl.params.lead();
-            sc.redundancy = ctl.params.redundancy();
-            sc.last_lead_ms = ctl.params.last_lead();
-            sc.unicast = ctl.params.unicast();
-        }
-        if let Err(e) = cfg.save(cfg_path.as_str()) {
-            eprintln!("could not persist config: {e}");
-        }
+    persist_sources(config, cfg_path, registry);
+    Ok(StatusCode::OK)
+}
+
+/// Rebuild the config's source list from the live registry (folding in the
+/// current send-timing values) and write it to disk. Other config fields
+/// (interface, local client) are preserved.
+fn persist_sources(config: &Arc<Mutex<Config>>, cfg_path: &str, registry: &SourceRegistry) {
+    let mut cfg = config.lock().unwrap();
+    cfg.sources = registry.configs();
+    if let Err(e) = cfg.save(cfg_path) {
+        eprintln!("could not persist config: {e}");
     }
+}
+
+/// The full server config, for the web-UI config editor. Each source is its flat
+/// config plus its derived `id` (a string, since ids exceed JS safe ints) so the
+/// editor can target the PUT/DELETE endpoints.
+#[handler]
+fn get_config(
+    Data(config): Data<&Arc<Mutex<Config>>>,
+    Data(sid): Data<&Arc<LocalServerId>>,
+) -> Json<serde_json::Value> {
+    let cfg = config.lock().unwrap();
+    let sources: Vec<serde_json::Value> = cfg
+        .sources
+        .iter()
+        .map(|s| {
+            let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
+            let id = crate::catalog::source_id(sid.0, &s.name);
+            if let Some(map) = v.as_object_mut() {
+                map.insert("id".into(), serde_json::Value::String(id.to_string()));
+            }
+            v
+        })
+        .collect();
+    Json(serde_json::json!({
+        "interface": cfg.interface.map(|i| i.to_string()),
+        "sources": sources,
+    }))
+}
+
+/// Add a new source at runtime (spawns it and persists the config).
+#[handler]
+fn add_source(
+    Data(registry): Data<&Arc<SourceRegistry>>,
+    Data(config): Data<&Arc<Mutex<Config>>>,
+    Data(cfg_path): Data<&Arc<String>>,
+    Json(body): Json<SourceConfig>,
+) -> poem::Result<StatusCode> {
+    registry
+        .spawn(&body)
+        .map_err(|e| poem::Error::from_string(e, StatusCode::BAD_REQUEST))?;
+    persist_sources(config, cfg_path, registry);
+    Ok(StatusCode::OK)
+}
+
+/// Replace a source at runtime: remove the old one and spawn the new config.
+#[handler]
+fn update_source(
+    Path(id): Path<String>,
+    Data(registry): Data<&Arc<SourceRegistry>>,
+    Data(config): Data<&Arc<Mutex<Config>>>,
+    Data(cfg_path): Data<&Arc<String>>,
+    Json(body): Json<SourceConfig>,
+) -> poem::Result<StatusCode> {
+    let id: u64 = id
+        .parse()
+        .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?;
+    if !registry.contains(id) {
+        return Err(poem::Error::from_status(StatusCode::NOT_FOUND));
+    }
+    registry.remove(id);
+    registry
+        .spawn(&body)
+        .map_err(|e| poem::Error::from_string(e, StatusCode::BAD_REQUEST))?;
+    persist_sources(config, cfg_path, registry);
+    Ok(StatusCode::OK)
+}
+
+/// Remove a source at runtime (stops it and persists the config).
+#[handler]
+fn delete_source(
+    Path(id): Path<String>,
+    Data(registry): Data<&Arc<SourceRegistry>>,
+    Data(config): Data<&Arc<Mutex<Config>>>,
+    Data(cfg_path): Data<&Arc<String>>,
+) -> poem::Result<StatusCode> {
+    let id: u64 = id
+        .parse()
+        .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?;
+    if !registry.remove(id) {
+        return Err(poem::Error::from_status(StatusCode::NOT_FOUND));
+    }
+    persist_sources(config, cfg_path, registry);
     Ok(StatusCode::OK)
 }
 
@@ -448,7 +556,7 @@ pub fn run(
     telemetry: Arc<TelemetryStore>,
     clients_store: Arc<ClientStore>,
     control: Arc<ControlSender>,
-    controls: Arc<Vec<SourceControl>>,
+    registry: Arc<SourceRegistry>,
     config: Arc<Mutex<Config>>,
     config_path: String,
     port: u16,
@@ -458,16 +566,20 @@ pub fn run(
         let app = Route::new()
             .at("/", get(index))
             .at("/api/events", get(events))
-            .at("/api/clients/:mac/volume", put(set_volume))
-            .at("/api/clients/:mac/delay", put(set_delay))
-            .at("/api/clients/:mac/source", put(set_source))
-            .at("/api/clients/:mac/name", put(set_name))
+            .at("/api/config", get(get_config))
+            .at("/api/clients/:id/volume", put(set_volume))
+            .at("/api/clients/:id/delay", put(set_delay))
+            .at("/api/clients/:id/source", put(set_source))
+            .at("/api/clients/:id/name", put(set_name))
+            .at("/api/clients/:id/channelmap", put(set_channel_map))
+            .at("/api/sources", post(add_source))
+            .at("/api/sources/:id", put(update_source).delete(delete_source))
             .at("/api/sources/:id/send", put(set_send))
             .data(catalog)
             .data(telemetry)
             .data(clients_store)
             .data(control)
-            .data(controls)
+            .data(registry)
             .data(config)
             .data(Arc::new(config_path))
             .data(Arc::new(LocalServerId(server_id)));

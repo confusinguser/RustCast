@@ -28,7 +28,7 @@ const MAX_SLEW_FRACTION: f64 = 0.005;
 
 /// Number of quick exchanges to do before settling into the steady interval.
 const WARMUP_SAMPLES: usize = 8;
-const WARMUP_INTERVAL_MS: u64 = 150;
+const WARMUP_INTERVAL_MS: u64 = 50;
 /// Steady sync cadence.
 const STEADY_INTERVAL_MS: u64 = 500;
 /// How often the sync thread wakes to re-check its target while nothing is
@@ -227,6 +227,9 @@ struct SettingsInner {
     /// since a device can't play earlier than the buffered lead. Kept current by
     /// the selection watcher from the catalog.
     active_lead_ms: u32,
+    /// Output channel map: one source-channel index per output channel (`-1` =
+    /// silence). Empty means the default identity mapping (out i ← src i).
+    channel_map: Vec<i16>,
 }
 
 impl ClientSettings {
@@ -239,6 +242,7 @@ impl ClientSettings {
                 volume_dirty: true, // apply the initial volume once at startup
                 selection_epoch: 0,
                 active_lead_ms: MAX_DELAY_MS,
+                channel_map: Vec::new(),
             }),
             cv: Condvar::new(),
         }
@@ -261,6 +265,15 @@ impl ClientSettings {
     /// Send lead (ms) of the selected source — the total-buffer budget basis.
     pub fn active_lead_ms(&self) -> u32 {
         self.inner.lock().unwrap().active_lead_ms
+    }
+
+    /// The current output channel map (empty = default identity mapping).
+    pub fn channel_map(&self) -> Vec<i16> {
+        self.inner.lock().unwrap().channel_map.clone()
+    }
+
+    fn set_channel_map(&self, map: Vec<i16>) {
+        self.inner.lock().unwrap().channel_map = map;
     }
 
     /// The current volume if it changed since the last call, clearing the flag.
@@ -321,6 +334,9 @@ impl ClientSettings {
         }
         if let Some(id) = cmd.set_source_id {
             self.set_selection(id);
+        }
+        if let Some(map) = &cmd.set_channel_map {
+            self.set_channel_map(map.clone());
         }
     }
 
@@ -388,31 +404,31 @@ pub fn run_client_sync(
             client_send_ms: t1,
             nonce,
             selected_source_id: settings.selected(),
+            channel_map: settings.channel_map(),
         };
         if let Ok(bytes) = bincode::serialize(&req) {
             let _ = sock.send_to(&bytes, dest);
         }
 
         // Wait for the matching reply (drop stale/mismatched ones).
-        if let Ok((n, _)) = sock.recv_from(&mut buf) {
-            if let Ok(resp) = bincode::deserialize::<TimeResponse>(&buf[..n]) {
-                if resp.nonce == nonce {
-                    let t4 = now_epoch_ms();
-                    let rtt = t4.saturating_sub(t1) as f64;
-                    // offset = server_clock − midpoint of the client send/recv.
-                    let offset = resp.server_ms as f64 - (t1 as f64 + t4 as f64) / 2.0;
-                    clock.add_sample(offset, rtt);
-                    let st = clock.stats();
-                    metrics.record_sync(
-                        st.applied_offset_ms,
-                        st.target_offset_ms,
-                        st.last_offset_ms,
-                        st.last_rtt_ms,
-                        st.best_rtt_ms,
-                        st.samples as u32,
-                    );
-                }
-            }
+        if let Ok((n, _)) = sock.recv_from(&mut buf)
+            && let Ok(resp) = bincode::deserialize::<TimeResponse>(&buf[..n])
+            && resp.nonce == nonce
+        {
+            let t4 = now_epoch_ms();
+            let rtt = t4.saturating_sub(t1) as f64;
+            // offset = server_clock − midpoint of the client send/recv.
+            let offset = resp.server_ms as f64 - (t1 as f64 + t4 as f64) / 2.0;
+            clock.add_sample(offset, rtt);
+            let st = clock.stats();
+            metrics.record_sync(
+                st.applied_offset_ms,
+                st.target_offset_ms,
+                st.last_offset_ms,
+                st.last_rtt_ms,
+                st.best_rtt_ms,
+                st.samples as u32,
+            );
         }
 
         let interval = if clock.sample_count() < WARMUP_SAMPLES {
@@ -428,11 +444,20 @@ pub fn run_client_sync(
 /// request naming it. A few sync intervals, so a dropped request is tolerated.
 const LISTENER_TTL: Duration = Duration::from_secs(3);
 
+/// One listening client: when it was last heard, and the output channel map it
+/// reported (empty = default identity / full stream). The map lets the send path
+/// stream only the source channels this client actually plays in unicast mode.
+struct Listener {
+    seen: Instant,
+    channel_map: Vec<i16>,
+}
+
 /// Which clients are currently listening to each local source, learned from the
-/// `selected_source_id` on their time-sync requests. Lets the server stop an
-/// unheard source and target unicast mode.
+/// `selected_source_id` (and channel map) on their time-sync requests. Lets the
+/// server stop an unheard source, target unicast mode, and — in unicast mode —
+/// send each client only the channels it plays.
 pub struct Listeners {
-    inner: Mutex<HashMap<u64, HashMap<Ipv4Addr, Instant>>>,
+    inner: Mutex<HashMap<u64, HashMap<Ipv4Addr, Listener>>>,
 }
 
 impl Listeners {
@@ -442,8 +467,9 @@ impl Listeners {
         }
     }
 
-    /// Record that `ip` is listening to `source_id` (0 = none, ignored).
-    pub fn touch(&self, source_id: u64, ip: Ipv4Addr) {
+    /// Record that `ip` is listening to `source_id` (0 = none, ignored), with the
+    /// client's current output `channel_map` (empty = identity / full stream).
+    pub fn touch(&self, source_id: u64, ip: Ipv4Addr, channel_map: Vec<i16>) {
         if source_id == 0 {
             return;
         }
@@ -452,7 +478,13 @@ impl Listeners {
             .unwrap()
             .entry(source_id)
             .or_default()
-            .insert(ip, Instant::now());
+            .insert(
+                ip,
+                Listener {
+                    seen: Instant::now(),
+                    channel_map,
+                },
+            );
     }
 
     /// Current listener IPs for a source (pruned to [`LISTENER_TTL`]).
@@ -460,8 +492,24 @@ impl Listeners {
         let mut map = self.inner.lock().unwrap();
         let now = Instant::now();
         if let Some(set) = map.get_mut(&source_id) {
-            set.retain(|_, seen| now.duration_since(*seen) < LISTENER_TTL);
+            set.retain(|_, l| now.duration_since(l.seen) < LISTENER_TTL);
             set.keys().copied().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Current listeners for a source as `(ip, channel_map)` pairs (pruned to
+    /// [`LISTENER_TTL`]). The channel map (empty = full stream) drives per-client
+    /// channel subsetting in unicast mode.
+    pub fn targets(&self, source_id: u64) -> Vec<(Ipv4Addr, Vec<i16>)> {
+        let mut map = self.inner.lock().unwrap();
+        let now = Instant::now();
+        if let Some(set) = map.get_mut(&source_id) {
+            set.retain(|_, l| now.duration_since(l.seen) < LISTENER_TTL);
+            set.iter()
+                .map(|(ip, l)| (*ip, l.channel_map.clone()))
+                .collect()
         } else {
             Vec::new()
         }
@@ -496,7 +544,7 @@ pub fn run_server_responder(sync_port: u16, listeners: Arc<Listeners>) {
             Ok((n, from)) => {
                 if let Ok(req) = bincode::deserialize::<TimeRequest>(&buf[..n]) {
                     if let std::net::SocketAddr::V4(v4) = from {
-                        listeners.touch(req.selected_source_id, *v4.ip());
+                        listeners.touch(req.selected_source_id, *v4.ip(), req.channel_map.clone());
                     }
                     let resp = TimeResponse {
                         client_send_ms: req.client_send_ms,

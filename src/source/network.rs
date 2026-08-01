@@ -42,6 +42,10 @@ pub struct PlayChunk {
     pub samples: Vec<f32>,
     pub channels: u16,
     pub sample_rate: u32,
+    /// Source-channel index of each channel present in `samples` (empty = the
+    /// full contiguous stream). Lets the client route a subset packet — sent in
+    /// unicast mode — back to output channels by original source index.
+    pub channel_ids: Vec<u16>,
 }
 
 struct BufState {
@@ -99,9 +103,10 @@ impl NetworkSource {
             let shared = shared.clone();
             let metrics = metrics.clone();
             let socket = socket.clone();
+            let clock = clock.clone();
             thread::Builder::new()
                 .name("net-recv".into())
-                .spawn(move || recv_loop(socket, shared, metrics))?
+                .spawn(move || recv_loop(socket, shared, clock, metrics))?
         };
 
         let watcher = {
@@ -192,11 +197,12 @@ impl NetworkSource {
                         .wait_timeout(bs, Duration::from_millis(JITTER_WAIT_MS))
                         .unwrap();
                     bs = guard;
-                    if res.timed_out() && !bs.packets.contains_key(&bs.next_seq) {
-                        if let Some(&next_present) = bs.packets.keys().next() {
-                            self.metrics.record_lost(next_present - bs.next_seq);
-                            bs.next_seq = next_present;
-                        }
+                    if res.timed_out()
+                        && !bs.packets.contains_key(&bs.next_seq)
+                        && let Some(&next_present) = bs.packets.keys().next()
+                    {
+                        self.metrics.record_lost(next_present - bs.next_seq);
+                        bs.next_seq = next_present;
                     }
                 }
                 // Buffer empty: wait. Silence is normal (source paused / off); we
@@ -216,7 +222,8 @@ impl NetworkSource {
         loop {
             // Don't start (or resume after a server switch) until the clock has a
             // full warmup estimate — playing against a not-yet-settled offset
-            // would jump. The receiver keeps filling the jitter buffer meanwhile.
+            // would jump. The receiver also rejects packets until then, so the
+            // jitter buffer starts fresh here rather than holding stale ones.
             if !self.clock.is_initialized() {
                 if self.shared.closed.load(Ordering::Relaxed) {
                     return None;
@@ -251,12 +258,18 @@ impl NetworkSource {
                 samples: pkt.format.decode(&pkt.data),
                 channels: pkt.channels,
                 sample_rate: pkt.sample_rate,
+                channel_ids: pkt.channel_ids,
             });
         }
     }
 }
 
-fn recv_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>, metrics: Arc<DeviceMetrics>) {
+fn recv_loop(
+    socket: Arc<UdpSocket>,
+    shared: Arc<Shared>,
+    clock: Arc<SyncedClock>,
+    metrics: Arc<DeviceMetrics>,
+) {
     let mut buf = [0u8; 65536];
     loop {
         match socket.recv_from(&mut buf) {
@@ -264,6 +277,13 @@ fn recv_loop(socket: Arc<UdpSocket>, shared: Arc<Shared>, metrics: Arc<DeviceMet
                 let active = shared.active_source_id.load(Ordering::Relaxed);
                 if active == 0 {
                     continue; // nothing selected: ignore all audio
+                }
+                // Don't buffer anything until the clock warmup is complete: with
+                // no trustworthy play-at reference yet, these packets would only
+                // pile up and be dropped/late once playback starts. Reject them so
+                // the jitter buffer starts fresh at warmup, aligned to the clock.
+                if !clock.is_initialized() {
+                    continue;
                 }
                 if let Ok(pkt) = bincode::deserialize::<AudioPacket>(&buf[..n]) {
                     // Reject packets from a source we aren't currently playing
@@ -357,10 +377,10 @@ fn run_selection_watcher(
                     metrics.set_jitter_buffer_len(0);
                 }
                 shared.cv.notify_all();
-                if let Some(old) = joined_group {
-                    if old != group {
-                        let _ = socket.leave_multicast_v4(&old, &iface);
-                    }
+                if let Some(old) = joined_group
+                    && old != group
+                {
+                    let _ = socket.leave_multicast_v4(&old, &iface);
                 }
                 joined_group = Some(group);
                 active_id = selected;
