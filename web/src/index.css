@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Range sliders — hand-styled so the thumb isn't clipped and the track has
+   fully rounded corners. Single-color track + colored thumb (no gradient fill).
+   The input box is tall enough (18px) to hold the 16px thumb without cutting
+   off its bottom. `.is-muted` and `:disabled` gray it out. */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: #e2e8f0;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  margin-top: -5px;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #10b981;
+  border: 2px solid #ffffff;
+}
+input[type="range"]::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: #e2e8f0;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #10b981;
+  border: 2px solid #ffffff;
+}
+input[type="range"]:focus {
+  outline: none;
+}
+input[type="range"].is-muted::-webkit-slider-thumb,
+input[type="range"]:disabled::-webkit-slider-thumb {
+  background: #cbd5e1;
+}
+input[type="range"].is-muted::-moz-range-thumb,
+input[type="range"]:disabled::-moz-range-thumb {
+  background: #cbd5e1;
+}
+input[type="range"]:disabled {
+  cursor: default;
+}
+
+/* Thin, unobtrusive scrollbars for the independent buffer columns. */
+.thin-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 8px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}

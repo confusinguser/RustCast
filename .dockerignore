@@ -8,3 +8,4 @@ rustcast.yaml
 clients.json
 testfifo
 *.md
+web/node_modules

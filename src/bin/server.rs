@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 
-use rustcast::api::{self, ControlSender};
+use rustcast::api::{self, ControlSender, LocalClientCtl};
 use rustcast::catalog::{
     CatalogStore, EntriesProvider, run_catalog_announcer, run_catalog_receiver,
     run_catalog_responder,
@@ -36,6 +36,7 @@ const HTTP_PORT: u16 = 8080;
 const SERVER_SAMPLE_MS: u64 = 100;
 /// Where per-client settings are persisted.
 const CLIENTS_JSON: &str = "clients.json";
+const GROUPS_JSON: &str = "groups.json";
 /// How often the reconciler enforces persisted settings onto clients.
 const RECONCILE_MS: u64 = 500;
 
@@ -93,8 +94,11 @@ fn main() {
     }
 
     // A playback client inside this process, if configured (the server machine
-    // also plays). Reaches its own server over loopback multicast.
+    // also plays). Reaches its own server over loopback multicast. The ctl lets
+    // the web UI enable one live; `running` starts true when config already has
+    // one so the API won't double-spawn it.
     let local_client = config.local_client.clone();
+    let local_ctl = Arc::new(LocalClientCtl::new(iface, local_client.is_some()));
 
     // Config is shared so the API can persist source + send-timing edits.
     let config = Arc::new(Mutex::new(config));
@@ -105,6 +109,8 @@ fn main() {
     let control = Arc::new(ControlSender::new(iface).expect("bind control socket"));
     // Durable per-client settings, keyed by device id.
     let clients_store = Arc::new(ClientStore::load(CLIENTS_JSON));
+    // Durable client groups.
+    let groups_store = Arc::new(rustcast::groups::GroupStore::load(GROUPS_JSON));
 
     // Live providers: read the current source set fresh each time, so the
     // announcer / stats threads reflect hot-added/removed sources.
@@ -124,20 +130,24 @@ fn main() {
         let catalog = catalog_store.clone();
         let telemetry = telemetry.clone();
         let clients = clients_store.clone();
+        let groups = groups_store.clone();
         let control = control.clone();
         let registry = registry.clone();
         let config = config.clone();
         let config_path = config_path.clone();
+        let local_ctl = local_ctl.clone();
         std::thread::spawn(move || {
             api::run(
                 server_id,
                 catalog,
                 telemetry,
                 clients,
+                groups,
                 control,
                 registry,
                 config,
                 config_path,
+                local_ctl,
                 HTTP_PORT,
             )
         });

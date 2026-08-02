@@ -16,11 +16,11 @@ WORKDIR /build
 # Cache dependency compilation: build against a stub source first, then the real
 # tree. Any change to src/ or web/ invalidates only the final layer.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src/bin web \
+RUN mkdir -p src/bin web/dist \
     && echo 'fn main() {}' > src/bin/server.rs \
     && echo 'fn main() {}' > src/bin/client.rs \
     && echo '// stub' > src/lib.rs \
-    && : > web/index.html \
+    && : > web/dist/index.html \
     && cargo build --release --locked --bins \
     && rm -rf src web
 

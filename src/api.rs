@@ -5,30 +5,64 @@
 //! it. Same-origin as the API, so no CORS is needed.
 
 use std::net::{Ipv4Addr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use poem::http::StatusCode;
 use poem::listener::TcpListener;
 use poem::web::sse::{Event, SSE};
 use poem::web::{Data, Html, Json, Path};
-use poem::{EndpointExt, Route, Server, get, handler, post, put};
+use poem::{EndpointExt, Route, Server, delete, get, handler, post, put};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogStore;
 use crate::clients::ClientStore;
-use crate::config::{Config, SourceConfig};
+use crate::config::{Config, LocalClientConfig, SourceConfig};
+use crate::groups::GroupStore;
 use crate::metrics::{SourceMeta, TelemetryStore};
 use crate::net::set_multicast_if;
 use crate::supervisor::SourceRegistry;
 use crate::wire::{CONTROL_GROUP, CONTROL_PORT, ControlCommand, MAX_LEAD_MS, WireFormat};
 
-/// The single-page UI, compiled into the binary.
-const INDEX_HTML: &str = include_str!("../web/index.html");
+/// The single-page UI, compiled into the binary. Built from the Vite project in
+/// `web/` (`npm run build` inlines all JS + CSS into one self-contained file);
+/// the built artifact is committed so `cargo build` needs no Node toolchain.
+const INDEX_HTML: &str = include_str!("../web/dist/index.html");
 
 /// This server's own id, injected so `/api/stats` can mark which streams are
 /// remote (hosted by another server).
 pub struct LocalServerId(pub u64);
+
+/// Runtime handle for the in-process playback client (see
+/// [`crate::config::LocalClientConfig`]). Lets the web UI enable it live; the
+/// running client can't be cleanly stopped, so disabling/renaming persists to
+/// the config and takes effect on the next restart.
+pub struct LocalClientCtl {
+    iface: Ipv4Addr,
+    running: AtomicBool,
+}
+
+impl LocalClientCtl {
+    pub fn new(iface: Ipv4Addr, running: bool) -> Self {
+        Self {
+            iface,
+            running: AtomicBool::new(running),
+        }
+    }
+
+    /// Spawn the in-process client if it isn't already running. `swap` makes the
+    /// check-and-set atomic, so concurrent PUTs can't double-spawn.
+    fn ensure_running(&self, name: Option<String>) {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return; // already running this session
+        }
+        let iface = self.iface;
+        let device_id = Some(format!("{}-local", crate::client::hostname()));
+        let _ = std::thread::Builder::new()
+            .name("local-client".into())
+            .spawn(move || crate::client::run_client(iface, None, device_id, name));
+    }
+}
 
 /// Multicasts control commands to clients. One per server; shared by handlers.
 pub struct ControlSender {
@@ -120,6 +154,17 @@ struct ClientDto {
     /// Current output channel map (one source-channel index per output channel,
     /// `-1` = silence). Empty = default identity mapping.
     channel_map: Vec<i16>,
+    /// Group this client belongs to (`null` = ungrouped).
+    group_id: Option<String>,
+}
+
+/// A client group, for the Clients board. `source_id` is resolved from the
+/// stored source name to the *current* id ("" = none / not yet in the catalog).
+#[derive(Serialize)]
+struct GroupDto {
+    id: String,
+    name: Option<String>,
+    source_id: String,
 }
 
 #[derive(Serialize)]
@@ -187,11 +232,13 @@ fn client_dtos(store: &TelemetryStore, clients_store: &ClientStore) -> Vec<Clien
         .clients_summary()
         .into_iter()
         .map(|c| {
+            let rec = clients_store.get(&c.id);
             // Display name: stored override, else the reported hostname.
-            let name = clients_store
-                .get(&c.id)
-                .and_then(|r| r.name)
+            let name = rec
+                .as_ref()
+                .and_then(|r| r.name.clone())
                 .unwrap_or(c.hostname);
+            let group_id = rec.and_then(|r| r.group);
             ClientDto {
                 id: c.id,
                 ip: c.ip.to_string(),
@@ -207,9 +254,50 @@ fn client_dtos(store: &TelemetryStore, clients_store: &ClientStore) -> Vec<Clien
                 },
                 output_channels: c.output_channels,
                 channel_map: c.channel_map,
+                group_id,
             }
         })
         .collect()
+}
+
+/// The group list, with each group's stored source name resolved to a current
+/// source id string ("" when off / not in the catalog).
+fn group_dtos(groups: &GroupStore, catalog: &CatalogStore) -> Vec<GroupDto> {
+    groups
+        .list()
+        .into_iter()
+        .map(|(id, r)| {
+            let source_id = r
+                .source
+                .as_deref()
+                .and_then(|n| source_id_by_name(catalog, n))
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            GroupDto {
+                id,
+                name: r.name,
+                source_id,
+            }
+        })
+        .collect()
+}
+
+/// Look up a catalog source id by name (first match).
+fn source_id_by_name(catalog: &CatalogStore, name: &str) -> Option<u64> {
+    catalog
+        .snapshot()
+        .into_iter()
+        .find(|r| r.entry.name == name)
+        .map(|r| r.entry.source_id)
+}
+
+/// Look up a catalog source name by id.
+fn source_name_by_id(catalog: &CatalogStore, id: u64) -> Option<String> {
+    catalog
+        .snapshot()
+        .into_iter()
+        .find(|r| r.entry.source_id == id)
+        .map(|r| r.entry.name)
 }
 
 /// The global source catalog for the UI dropdown.
@@ -263,6 +351,7 @@ struct EventPayload {
     clients_hist: Vec<StatsSnapshotClient>,
     clients: Vec<ClientDto>,
     catalog: Vec<SourceDto>,
+    groups: Vec<GroupDto>,
 }
 // Aliases so the SSE payload reuses the store's history structs.
 type StatsSnapshotServer = crate::metrics::ServerSourceStats;
@@ -277,6 +366,7 @@ fn events(
     Data(store): Data<&Arc<TelemetryStore>>,
     Data(catalog): Data<&Arc<CatalogStore>>,
     Data(clients_store): Data<&Arc<ClientStore>>,
+    Data(groups_store): Data<&Arc<GroupStore>>,
     Data(registry): Data<&Arc<SourceRegistry>>,
     Data(sid): Data<&Arc<LocalServerId>>,
 ) -> SSE {
@@ -284,6 +374,7 @@ fn events(
         store: Arc<TelemetryStore>,
         catalog: Arc<CatalogStore>,
         clients_store: Arc<ClientStore>,
+        groups_store: Arc<GroupStore>,
         registry: Arc<SourceRegistry>,
         my_id: u64,
         first: bool,
@@ -295,6 +386,7 @@ fn events(
         store: store.clone(),
         catalog: catalog.clone(),
         clients_store: clients_store.clone(),
+        groups_store: groups_store.clone(),
         registry: registry.clone(),
         my_id: sid.0,
         first: true,
@@ -334,6 +426,7 @@ fn events(
             clients_hist,
             clients: client_dtos(&st.store, &st.clients_store),
             catalog: catalog_dtos(&st.catalog),
+            groups: group_dtos(&st.groups_store, &st.catalog),
         };
         st.first = false;
         let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
@@ -417,6 +510,125 @@ fn set_channel_map(
     clients_store.set_channel_map(&id, body.map.clone()); // persist (authoritative)
     if let Some(ip) = store.ip_for_id(&id) {
         control.send_channel_map(ip, body.map); // push to the client now
+    }
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct GroupBody {
+    /// Group id to join; `null`/"" leaves the current group.
+    #[serde(default)]
+    group_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreatedGroup {
+    id: String,
+}
+
+/// Create a new, empty group and return its id.
+#[handler]
+fn create_group(Data(groups): Data<&Arc<GroupStore>>) -> Json<CreatedGroup> {
+    Json(CreatedGroup {
+        id: groups.create(),
+    })
+}
+
+/// Delete a group and drop all its members back to ungrouped.
+#[handler]
+fn delete_group(
+    Path(gid): Path<String>,
+    Data(groups): Data<&Arc<GroupStore>>,
+    Data(clients_store): Data<&Arc<ClientStore>>,
+) -> poem::Result<StatusCode> {
+    clients_store.clear_group(&gid);
+    if groups.delete(&gid) {
+        Ok(StatusCode::OK)
+    } else {
+        Err(poem::Error::from_status(StatusCode::NOT_FOUND))
+    }
+}
+
+/// Rename a group (`null`/"" clears the name).
+#[handler]
+fn set_group_name(
+    Path(gid): Path<String>,
+    Data(groups): Data<&Arc<GroupStore>>,
+    Json(body): Json<NameBody>,
+) -> poem::Result<StatusCode> {
+    if !groups.exists(&gid) {
+        return Err(poem::Error::from_status(StatusCode::NOT_FOUND));
+    }
+    groups.set_name(&gid, body.name);
+    Ok(StatusCode::OK)
+}
+
+/// Point a group at a source (or, with empty/null, at nothing): persist the
+/// choice by name and push the source to every current member.
+#[handler]
+fn set_group_source(
+    Path(gid): Path<String>,
+    Data(groups): Data<&Arc<GroupStore>>,
+    Data(clients_store): Data<&Arc<ClientStore>>,
+    Data(catalog): Data<&Arc<CatalogStore>>,
+    Data(store): Data<&Arc<TelemetryStore>>,
+    Data(control): Data<&Arc<ControlSender>>,
+    Json(body): Json<SourceBody>,
+) -> poem::Result<StatusCode> {
+    if !groups.exists(&gid) {
+        return Err(poem::Error::from_status(StatusCode::NOT_FOUND));
+    }
+    let source_id: u64 = match body.source_id.as_deref() {
+        None | Some("") => 0,
+        Some(s) => s
+            .parse()
+            .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?,
+    };
+    // Persist id-independently (see groups module note).
+    let name = if source_id == 0 {
+        None
+    } else {
+        source_name_by_id(catalog, source_id)
+    };
+    groups.set_source(&gid, name);
+    for mac in clients_store.members(&gid) {
+        if let Some(ip) = store.ip_for_id(&mac) {
+            control.send(ip, Some(source_id), None, None);
+        }
+    }
+    Ok(StatusCode::OK)
+}
+
+/// Move a client into a group (or, with empty/null, out of its group). Joining
+/// a group that already has a source makes the client adopt it immediately.
+#[handler]
+fn set_client_group(
+    Path(id): Path<String>,
+    Data(groups): Data<&Arc<GroupStore>>,
+    Data(clients_store): Data<&Arc<ClientStore>>,
+    Data(catalog): Data<&Arc<CatalogStore>>,
+    Data(store): Data<&Arc<TelemetryStore>>,
+    Data(control): Data<&Arc<ControlSender>>,
+    Json(body): Json<GroupBody>,
+) -> poem::Result<StatusCode> {
+    let gid = body.group_id.filter(|s| !s.is_empty());
+    if let Some(g) = &gid
+        && !groups.exists(g)
+    {
+        return Err(poem::Error::from_status(StatusCode::NOT_FOUND));
+    }
+    clients_store.set_group(&id, gid.clone());
+    // A client in a group plays the group's source — which may be nothing, in
+    // which case it falls silent (id 0) rather than keeping its old source.
+    if let Some(g) = &gid
+        && let Some(ip) = store.ip_for_id(&id)
+    {
+        let sid = groups
+            .get(g)
+            .and_then(|r| r.source)
+            .and_then(|name| source_id_by_name(catalog, &name))
+            .unwrap_or(0);
+        control.send(ip, Some(sid), None, None);
     }
     Ok(StatusCode::OK)
 }
@@ -507,7 +719,45 @@ fn get_config(
     Json(serde_json::json!({
         "interface": cfg.interface.map(|i| i.to_string()),
         "sources": sources,
+        // Present (with a name) when an in-process playback client is enabled.
+        "local_client": cfg.local_client,
     }))
+}
+
+#[derive(Deserialize)]
+struct LocalClientBody {
+    /// Whether the in-process playback client should run.
+    enabled: bool,
+    /// Display name for it; `null`/absent falls back to the hostname.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Enable/disable the in-process playback client and set its name. Persists to
+/// the config; enabling starts a player immediately, while disabling or renaming
+/// takes effect on the next server restart (a running client can't be stopped
+/// cleanly).
+#[handler]
+fn set_local_client(
+    Data(registry): Data<&Arc<SourceRegistry>>,
+    Data(config): Data<&Arc<Mutex<Config>>>,
+    Data(cfg_path): Data<&Arc<String>>,
+    Data(local): Data<&Arc<LocalClientCtl>>,
+    Json(body): Json<LocalClientBody>,
+) -> poem::Result<StatusCode> {
+    let name = body.name.filter(|s| !s.trim().is_empty());
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.local_client = body.enabled.then(|| LocalClientConfig {
+            id: None,
+            name: name.clone(),
+        });
+    }
+    persist_sources(config, cfg_path, registry);
+    if body.enabled {
+        local.ensure_running(name);
+    }
+    Ok(StatusCode::OK)
 }
 
 /// Add a new source at runtime (spawns it and persists the config).
@@ -573,10 +823,12 @@ pub fn run(
     catalog: Arc<CatalogStore>,
     telemetry: Arc<TelemetryStore>,
     clients_store: Arc<ClientStore>,
+    groups_store: Arc<GroupStore>,
     control: Arc<ControlSender>,
     registry: Arc<SourceRegistry>,
     config: Arc<Mutex<Config>>,
     config_path: String,
+    local_client: Arc<LocalClientCtl>,
     port: u16,
 ) {
     let rt = tokio::runtime::Runtime::new().expect("build api runtime");
@@ -585,11 +837,17 @@ pub fn run(
             .at("/", get(index))
             .at("/api/events", get(events))
             .at("/api/config", get(get_config))
+            .at("/api/config/local_client", put(set_local_client))
             .at("/api/clients/:id/volume", put(set_volume))
             .at("/api/clients/:id/delay", put(set_delay))
             .at("/api/clients/:id/source", put(set_source))
             .at("/api/clients/:id/name", put(set_name))
             .at("/api/clients/:id/channelmap", put(set_channel_map))
+            .at("/api/clients/:id/group", put(set_client_group))
+            .at("/api/groups", post(create_group))
+            .at("/api/groups/:id", delete(delete_group))
+            .at("/api/groups/:id/name", put(set_group_name))
+            .at("/api/groups/:id/source", put(set_group_source))
             .at("/api/sources", post(add_source))
             .at("/api/sources/:id", put(update_source).delete(delete_source))
             .at("/api/sources/:id/send", put(set_send))
@@ -597,10 +855,12 @@ pub fn run(
             .data(catalog)
             .data(telemetry)
             .data(clients_store)
+            .data(groups_store)
             .data(control)
             .data(registry)
             .data(config)
             .data(Arc::new(config_path))
+            .data(local_client)
             .data(Arc::new(LocalServerId(server_id)));
 
         println!("HTTP API + UI on http://0.0.0.0:{port}");

@@ -1,3 +1,5 @@
 target
 rustcast.yaml
 clients.json
+web/node_modules
+groups.json

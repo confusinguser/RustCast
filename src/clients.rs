@@ -27,6 +27,10 @@ pub struct ClientRecord {
     /// reconnect). `None` when off or playing another server's source.
     #[serde(default)]
     pub source: Option<String>,
+    /// Id of the group this client belongs to (`None` = ungrouped). Members of a
+    /// group follow the group's chosen source; see [`crate::groups`].
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 impl Default for ClientRecord {
@@ -37,6 +41,7 @@ impl Default for ClientRecord {
             delay_ms: 0,
             channel_map: Vec::new(),
             source: None,
+            group: None,
         }
     }
 }
@@ -80,6 +85,7 @@ impl ClientStore {
             delay_ms,
             channel_map: Vec::new(),
             source: None,
+            group: None,
         };
         map.insert(mac.to_string(), rec.clone());
         self.save(&map);
@@ -111,6 +117,37 @@ impl ClientStore {
         let mut m = self.inner.lock().unwrap();
         m.entry(mac.to_string()).or_default().channel_map = map;
         self.save(&m);
+    }
+
+    /// Set (or, with `None`, clear) the client's group membership.
+    pub fn set_group(&self, mac: &str, group: Option<String>) {
+        let mut m = self.inner.lock().unwrap();
+        m.entry(mac.to_string()).or_default().group = group;
+        self.save(&m);
+    }
+
+    /// Ids of all clients belonging to `group`.
+    pub fn members(&self, group: &str) -> Vec<String> {
+        let m = self.inner.lock().unwrap();
+        m.iter()
+            .filter(|(_, r)| r.group.as_deref() == Some(group))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Drop every client out of `group` (used when the group is deleted).
+    pub fn clear_group(&self, group: &str) {
+        let mut m = self.inner.lock().unwrap();
+        let mut changed = false;
+        for r in m.values_mut() {
+            if r.group.as_deref() == Some(group) {
+                r.group = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&m);
+        }
     }
 
     /// Set (or, with `None`/empty, clear) the display-name override.
