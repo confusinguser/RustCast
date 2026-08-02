@@ -66,6 +66,12 @@ pub struct DeviceMetrics {
     last_rtt_bits: AtomicU64,
     rtt_bits: AtomicU64,
     sync_samples: AtomicU32,
+    /// Estimated delay from the source (ms), stored as f64 bits. Updated on each
+    /// append from the projected play time of the just-queued audio.
+    source_delay_bits: AtomicU64,
+    /// Duration of one packet/buffer in ms (f64 bits), for converting buffer
+    /// depths to milliseconds in the UI.
+    packet_ms_bits: AtomicU64,
 }
 
 impl DeviceMetrics {
@@ -127,6 +133,19 @@ impl DeviceMetrics {
         self.jitter_buffer_len.store(n as u32, Ordering::Relaxed);
     }
 
+    /// Record the latest estimated delay from the source, in ms (can be negative
+    /// if audio is projected to play ahead of its `play_at`).
+    pub fn set_source_delay(&self, ms: f64) {
+        self.source_delay_bits
+            .store(ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Record the current per-packet duration in ms, so the UI can convert the
+    /// jitter-buffer / output-queue depths from packet counts to milliseconds.
+    pub fn set_packet_ms(&self, ms: f64) {
+        self.packet_ms_bits.store(ms.to_bits(), Ordering::Relaxed);
+    }
+
     /// Current jitter-buffer depth in packets (for the combined-budget cap).
     pub fn jitter_buffer_len(&self) -> u32 {
         self.jitter_buffer_len.load(Ordering::Relaxed)
@@ -185,6 +204,8 @@ impl DeviceMetrics {
             last_rtt_ms: f64::from_bits(self.last_rtt_bits.load(Ordering::Relaxed)),
             rtt_ms: f64::from_bits(self.rtt_bits.load(Ordering::Relaxed)),
             sync_samples: self.sync_samples.load(Ordering::Relaxed),
+            source_delay_ms: f64::from_bits(self.source_delay_bits.load(Ordering::Relaxed)),
+            packet_ms: f64::from_bits(self.packet_ms_bits.load(Ordering::Relaxed)),
         }
     }
 }
@@ -343,6 +364,11 @@ pub struct ClientSample {
     pub last_rtt_ms: f64,
     pub rtt_ms: f64,
     pub sync_samples: u32,
+    /// Estimated delay from the source (ms) at report time; ≈ the delay setting
+    /// in steady state.
+    pub source_delay_ms: f64,
+    /// Per-packet duration (ms); multiply by the buffer depths for ms readouts.
+    pub packet_ms: f64,
 }
 
 /// One timestamped server send-path sample.
@@ -516,6 +542,8 @@ impl TelemetryStore {
             last_rtt_ms: report.last_rtt_ms,
             rtt_ms: report.rtt_ms,
             sync_samples: report.sync_samples,
+            source_delay_ms: report.source_delay_ms,
+            packet_ms: report.packet_ms,
         });
         while hist.samples.len() > HISTORY_LEN {
             hist.samples.pop_front();

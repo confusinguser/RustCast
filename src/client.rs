@@ -200,13 +200,24 @@ pub fn run_client(
         } else {
             1.0
         };
-        let budget_ms = (settings.active_lead_ms() + BUDGET_MARGIN_MS) as f64;
+        // Report the per-packet duration so the UI can show buffer depths in ms.
+        metrics.set_packet_ms(pkt_ms);
+        let budget_ms = (settings.active_lead_ms() - settings.delay_ms() + BUDGET_MARGIN_MS) as f64;
         let budget_pkts = (budget_ms / pkt_ms).ceil() as usize;
         let total = metrics.jitter_buffer_len() as usize + queued;
         if total > budget_pkts {
             metrics.record_overrun_drop();
             continue;
         }
+        // Estimated delay from the source: this chunk goes to the back of the
+        // player queue, so its first sample plays only after the audio already
+        // queued ahead of it drains (~`queued` packets). Project that play time on
+        // the synced server clock and compare to the chunk's own `play_at`; in
+        // steady state the gap sits near the client's delay setting.
+        let queued_ahead_ms = queued as f64 * pkt_ms;
+        let est_play_ms = clock.server_now_ms() + queued_ahead_ms;
+        metrics.set_source_delay(chunk.play_at_ms as f64 - est_play_ms);
+
         let routed = remap_channels(
             &chunk.samples,
             chunk.channels as usize,

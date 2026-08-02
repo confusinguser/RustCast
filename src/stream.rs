@@ -45,6 +45,9 @@ pub struct SendParams {
     /// When true, stream to each listening client's IP by unicast instead of the
     /// multicast group.
     unicast: AtomicBool,
+    /// Set to request a manual timeline re-anchor; the send loop consumes it on
+    /// its next packet (resetting `start_ms` to now) and clears it.
+    reanchor: AtomicBool,
 }
 
 impl SendParams {
@@ -54,6 +57,7 @@ impl SendParams {
             redundancy: AtomicU32::new(1),
             last_lead_ms: AtomicU64::new(0),
             unicast: AtomicBool::new(unicast),
+            reanchor: AtomicBool::new(false),
         };
         p.set_lead(lead_ms);
         p.set_redundancy(redundancy);
@@ -88,6 +92,14 @@ impl SendParams {
     }
     pub fn set_unicast(&self, on: bool) {
         self.unicast.store(on, Ordering::Relaxed);
+    }
+    /// Request a manual timeline re-anchor on the next emitted packet.
+    pub fn request_reanchor(&self) {
+        self.reanchor.store(true, Ordering::Relaxed);
+    }
+    /// Consume a pending re-anchor request, returning whether one was set.
+    pub fn take_reanchor(&self) -> bool {
+        self.reanchor.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -362,7 +374,7 @@ pub fn run_source_stream(
             // bursty source can't outrun the timeline and bloat client buffers.
             let mut offset_ms = total_frames * 1000 / sample_rate;
             let now = now_epoch_ms();
-            if start_ms + offset_ms + REANCHOR_TOLERANCE_MS < now {
+            if params.take_reanchor() || start_ms + offset_ms + REANCHOR_TOLERANCE_MS < now {
                 start_ms = now;
                 total_frames = 0;
                 offset_ms = 0;

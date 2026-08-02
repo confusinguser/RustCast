@@ -76,6 +76,7 @@
     .cfg-btn { background: #22304a; color: #cfe0ff; border: 1px solid #2c3d5c; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
     .cfg-btn.danger { background: #3a2130; color: #ffd0d8; border-color: #5c2c3a; }
     .cfg-btn:disabled { opacity: 0.4; cursor: default; }
+    .btn-row { display: flex; gap: 8px; margin-top: 12px; }
     .cfg-msg { color: #8b909a; font-weight: 400; }
     .empty { color: #8b909a; text-align: center; padding: 48px 0; }
     .err { color: #ff6b6b; font-size: 13px; margin-bottom: 16px; }
@@ -112,6 +113,7 @@
       rate: "#b98bf5",     // sample throughput
       pending: "#3fb9b0",  // server pending backlog
       send: "#e0c14c",     // server send rate
+      delay: "#5ad1e0",    // estimated delay from source
       drop: "#ff6b6b",     // overrun/late/lost events
       under: "#ffb020",    // underrun / re-anchor events
       grid: "#20242e",
@@ -134,6 +136,12 @@
     // A plain gauge series {x,y} for a numeric key.
     function gaugeSeries(samples, key) {
       return samples.map((s) => ({ x: s.t, y: s[key] }));
+    }
+
+    // A buffer-depth series converted to milliseconds via each sample's own
+    // per-packet duration (`packet_ms`), so it tracks format changes over time.
+    function msSeries(samples, key) {
+      return samples.map((s) => ({ x: s.t, y: (s[key] || 0) * (s.packet_ms || 0) }));
     }
 
     // Vertical event markers where the summed counters increased between samples.
@@ -293,7 +301,7 @@
 
     // ---- per-source server card --------------------------------------------
 
-    function ServerSourceCard({ src, sp, clockOffset, onSend }) {
+    function ServerSourceCard({ src, sp, clockOffset, onSend, onReanchor }) {
       const s = src.samples || [];
       const latest = s[s.length - 1];
       const sendRate = rateSeries(s, "packets_sent");
@@ -340,6 +348,10 @@
                   onChange={(e) => onSend(src.source_id, { unicast: e.target.checked })} />
                 <span>Unicast to listeners</span>
               </label>
+              <div className="btn-row">
+                <button className="cfg-btn" title="Reset this source's send timeline to real time now"
+                  onClick={() => onReanchor(src.source_id)}>Re-anchor</button>
+              </div>
             </div>
           )}
           <div className="stats">
@@ -380,19 +392,20 @@
       return (
         <div className="stats">
           <div className="readouts">
-            <div className="stat"><span className="k">Jitter buffer</span><span className="v">{latest.jitter_buffer_len} pkt</span></div>
-            <div className="stat"><span className="k">Output queue</span><span className={"v " + (latest.output_queue_len === 0 ? "warn" : "")}>{latest.output_queue_len} buf</span></div>
+            <div className="stat"><span className="k">Jitter buffer</span><span className="v">{latest.jitter_buffer_len} pkt · {(latest.jitter_buffer_len * (latest.packet_ms || 0)).toFixed(0)} ms</span></div>
+            <div className="stat"><span className="k">Output queue</span><span className={"v " + (latest.output_queue_len === 0 ? "warn" : "")}>{latest.output_queue_len} buf · {(latest.output_queue_len * (latest.packet_ms || 0)).toFixed(0)} ms</span></div>
             <div className="stat"><span className="k">Samples/s</span><span className="v">{lastRate.toFixed(0)}</span></div>
+            <div className="stat"><span className="k">Source delay</span><span className="v">{(latest.source_delay_ms || 0).toFixed(0)} ms</span></div>
             <div className="stat"><span className="k">Underruns</span><span className={"v " + (latest.underruns > 0 ? "warn" : "")}>{latest.underruns}</span></div>
             <div className="stat"><span className="k">Overrun</span><span className={"v " + (latest.overrun_drops > 0 ? "bad" : "")}>{latest.overrun_drops}</span></div>
             <div className="stat"><span className="k">Late</span><span className={"v " + (latest.late_drops > 0 ? "bad" : "")}>{latest.late_drops}</span></div>
             <div className="stat"><span className="k">Lost</span><span className={"v " + (latest.lost_packets > 0 ? "bad" : "")}>{latest.lost_packets}</span></div>
           </div>
           <Graph
-            title="Buffer depth" unit="jitter pkt · output buf" clockOffset={clockOffset} height={110}
+            title="Buffer depth" unit="ms buffered" clockOffset={clockOffset} height={110}
             series={[
-              { name: "jitter buffer", color: C.jitter, points: gaugeSeries(samples, "jitter_buffer_len") },
-              { name: "output queue", color: C.output, points: gaugeSeries(samples, "output_queue_len") },
+              { name: "jitter buffer", color: C.jitter, points: msSeries(samples, "jitter_buffer_len") },
+              { name: "output queue", color: C.output, points: msSeries(samples, "output_queue_len") },
             ]}
             markers={[...dropMarkers, ...underMarkers]}
           />
@@ -400,6 +413,10 @@
             title="Samples handed to player" unit="samples/s" clockOffset={clockOffset}
             series={[{ name: "rate", color: C.rate, points: rate }]}
             markers={[...dropMarkers, ...underMarkers]}
+          />
+          <Graph
+            title="Estimated delay from source" unit="ms · ≈ delay setting" clockOffset={clockOffset} signed height={110}
+            series={[{ name: "delay", color: C.delay, points: gaugeSeries(samples, "source_delay_ms") }]}
           />
           <div className="gtitle" style={{ marginTop: 6 }}>
             <span className="legend"><span className="swatch" style={{ background: C.drop }}></span>drop (overrun/late/lost)</span>
@@ -758,6 +775,10 @@
           body: JSON.stringify(patch),
         }).catch(() => {});
       };
+      // Manually re-anchor a source's send timeline (resync to real time).
+      const onReanchor = (id) => {
+        fetch(`/api/sources/${id}/reanchor`, { method: "POST" }).catch(() => {});
+      };
 
       // Index telemetry by MAC so each card can find its own history.
       const statsById = {};
@@ -783,7 +804,7 @@
               {sources.length === 0 && <div className="empty">No streams yet.</div>}
               {sources.map((src) => (
                 <ServerSourceCard key={src.source_id} src={src} sp={sendParams[src.source_id]}
-                  clockOffset={clockOffset} onSend={onSend} />
+                  clockOffset={clockOffset} onSend={onSend} onReanchor={onReanchor} />
               ))}
             </section>
 

@@ -42,6 +42,9 @@ pub struct PlayChunk {
     pub samples: Vec<f32>,
     pub channels: u16,
     pub sample_rate: u32,
+    /// Absolute play-at time (epoch ms, server clock) of this chunk's first
+    /// sample — carried through so the player loop can estimate playback delay.
+    pub play_at_ms: u64,
     /// Source-channel index of each channel present in `samples` (empty = the
     /// full contiguous stream). Lets the client route a subset packet — sent in
     /// unicast mode — back to output channels by original source index.
@@ -258,6 +261,7 @@ impl NetworkSource {
                 samples: pkt.format.decode(&pkt.data),
                 channels: pkt.channels,
                 sample_rate: pkt.sample_rate,
+                play_at_ms: pkt.play_at_ms,
                 channel_ids: pkt.channel_ids,
             });
         }

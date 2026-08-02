@@ -323,6 +323,16 @@ pub struct TelemetryReport {
     pub rtt_ms: f64,
     /// Number of sync samples currently held.
     pub sync_samples: u32,
+    /// Estimated delay from the source, ms: projecting when the most recently
+    /// queued sample will actually play (now + the audio already queued ahead of
+    /// it) and comparing to its `play_at` on the synced server clock. In steady
+    /// state this sits near the client's delay setting.
+    #[serde(default)]
+    pub source_delay_ms: f64,
+    /// Duration of one packet/buffer in ms (frames-per-packet ÷ sample rate), so
+    /// the UI can express the jitter-buffer and output-queue depths in ms.
+    #[serde(default)]
+    pub packet_ms: f64,
 }
 
 /// Current local wall-clock time as UNIX-epoch milliseconds. On the client this

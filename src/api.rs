@@ -454,6 +454,24 @@ fn set_send(
     Ok(StatusCode::OK)
 }
 
+/// Manually re-anchor a *local* source's send timeline (resets `start_ms` to now
+/// on its next packet, resyncing it to real time). 404 for a source id this
+/// server doesn't host.
+#[handler]
+fn reanchor_source(
+    Path(id): Path<String>,
+    Data(registry): Data<&Arc<SourceRegistry>>,
+) -> poem::Result<StatusCode> {
+    let id: u64 = id
+        .parse()
+        .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?;
+    let params = registry
+        .params(id)
+        .ok_or_else(|| poem::Error::from_status(StatusCode::NOT_FOUND))?;
+    params.request_reanchor();
+    Ok(StatusCode::OK)
+}
+
 /// Rebuild the config's source list from the live registry (folding in the
 /// current send-timing values) and write it to disk. Other config fields
 /// (interface, local client) are preserved.
@@ -575,6 +593,7 @@ pub fn run(
             .at("/api/sources", post(add_source))
             .at("/api/sources/:id", put(update_source).delete(delete_source))
             .at("/api/sources/:id/send", put(set_send))
+            .at("/api/sources/:id/reanchor", post(reanchor_source))
             .data(catalog)
             .data(telemetry)
             .data(clients_store)

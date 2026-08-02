@@ -12,8 +12,6 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::wire::MAX_DELAY_MS;
-
 /// One persisted client. `name = None` means "use the reported hostname".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientRecord {
@@ -79,7 +77,7 @@ impl ClientStore {
         let rec = ClientRecord {
             name: None,
             volume,
-            delay_ms: delay_ms.min(MAX_DELAY_MS),
+            delay_ms,
             channel_map: Vec::new(),
             source: None,
         };
@@ -96,7 +94,7 @@ impl ClientStore {
 
     pub fn set_delay(&self, mac: &str, delay_ms: u32) {
         let mut map = self.inner.lock().unwrap();
-        map.entry(mac.to_string()).or_default().delay_ms = delay_ms.min(MAX_DELAY_MS);
+        map.entry(mac.to_string()).or_default().delay_ms = delay_ms;
         self.save(&map);
     }
 
