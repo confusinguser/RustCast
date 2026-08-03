@@ -1,13 +1,12 @@
 //! Client-side playback source: receives multicast [`AudioPacket`]s for the
-//! currently-selected source into a sequence-ordered jitter buffer and plays
-//! them out aligned to each packet's absolute `play_at` timestamp, measured
-//! against a [`SyncedClock`] estimate of the owning server's clock.
+//! selected source into a sequence-ordered jitter buffer and plays them aligned
+//! to each packet's `play_at` timestamp against a [`SyncedClock`] estimate of
+//! the owning server's clock.
 //!
-//! The client owns its selection (in [`ClientSettings`]); a *watcher* thread
-//! reacts to selection changes and to the catalog, joining/leaving the right
-//! multicast group and re-pointing the clock sync at the owning server. There is
-//! no "server offline" concept: if nothing is selected, or the selected source
-//! is silent, playback simply produces nothing and waits.
+//! The client owns its selection; a watcher thread reacts to selection and
+//! catalog changes, joining/leaving the multicast group and re-pointing clock
+//! sync at the owning server. Nothing selected or a silent source simply
+//! produces no audio — there is no "server offline" concept.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -54,16 +53,13 @@ struct BufState {
     /// Buffered packets keyed by `play_at_ms`. Keying by play time (not seq)
     /// dedups the server's redundant copies for free — they share a play time.
     packets: BTreeMap<u64, AudioPacket>,
-    /// The (seq, play_at_ms) of the newest packet seen for the active source.
-    /// Used only to detect a timeline shift: a newer seq scheduled *earlier* than
-    /// this means the source re-anchored (or its lead shrank), so the buffered
-    /// packets from the old timeline can be dropped. `None` until the first
-    /// packet after a (re)selection.
+    /// (seq, play_at_ms) of the newest packet seen. Detects a timeline shift: a
+    /// newer seq scheduled *earlier* means the source re-anchored (or its lead
+    /// shrank), so old-timeline packets can be dropped. `None` until first packet.
     newest: Option<(u64, u64)>,
     /// Highest sequence number already pulled from the buffer. The server sends
-    /// each packet several times for redundancy (same seq); once we've taken one
-    /// copy, later-arriving copies are ignored silently rather than re-buffered
-    /// and counted late. `None` until the first pull after a (re)selection.
+    /// each packet several times (same seq); once we've taken one copy, later
+    /// ones are ignored rather than re-buffered and counted late. `None` initially.
     consumed_seq: Option<u64>,
 }
 
@@ -187,18 +183,15 @@ impl NetworkSource {
         }
     }
 
-    /// The next block of samples for the active source: the earliest buffered
-    /// packet, decoded, tagged with its `play_at`. This is a plain jitter buffer —
-    /// it does no play-time regulation; the player loop decides when (and whether)
-    /// to append each chunk against the real output-queue depth. `None` on a dead
-    /// socket, or if nothing arrives within `duration`.
+    /// Next block for the active source: earliest buffered packet, decoded and
+    /// tagged with its `play_at`. A plain jitter buffer — the player loop decides
+    /// when to append each chunk. `None` on dead socket or timeout.
     pub fn next_samples_timeout(&mut self, duration: Duration) -> Option<PlayChunk> {
         let start = std::time::Instant::now();
         loop {
-            // Don't start (or resume after a server switch) until the clock has a
-            // full warmup estimate — playing against a not-yet-settled offset
-            // would jump. The receiver also rejects packets until then, so the
-            // jitter buffer starts fresh here rather than holding stale ones.
+            // Don't start until the clock has a full warmup estimate — playing
+            // against a not-yet-settled offset would jump. The receiver also
+            // rejects packets until then, so the buffer starts fresh here.
             if !self.clock.is_initialized() {
                 if self.shared.closed.load(Ordering::Relaxed) {
                     return None;
@@ -210,10 +203,9 @@ impl NetworkSource {
             let remaining = duration.saturating_sub(start.elapsed());
             let pkt = self.pull_next(remaining)?;
 
-            // Cheap pre-decode drop of a packet already wholly in the past (e.g. a
-            // backlog after a stall), so we don't decode what can't be played.
-            // Partial-late handling — cropping the still-on-time tail — is done by
-            // the player loop, which knows the real output-queue depth.
+            // Cheap pre-decode drop of a packet already wholly in the past, so we
+            // don't decode what can't be played. Partial-late handling (cropping
+            // the still-on-time tail) is the player loop's job.
             let delay = self.settings.delay_ms() as f64;
             if (pkt.play_at_ms as f64 - delay + packet_duration_ms(&pkt))
                 < self.clock.server_now_ms()
@@ -256,10 +248,9 @@ fn recv_loop(
                 if active == 0 {
                     continue; // nothing selected: ignore all audio
                 }
-                // Don't buffer anything until the clock warmup is complete: with
-                // no trustworthy play-at reference yet, these packets would only
-                // pile up and be dropped/late once playback starts. Reject them so
-                // the jitter buffer starts fresh at warmup, aligned to the clock.
+                // Don't buffer until clock warmup is complete: with no trustworthy
+                // play-at reference, these would only pile up and be dropped once
+                // playback starts. Rejecting keeps the buffer fresh at warmup.
                 if !clock.is_initialized() {
                     continue;
                 }
@@ -271,17 +262,14 @@ fn recv_loop(
                     }
                     metrics.record_packet_received();
                     let mut bs = shared.buf.lock().unwrap();
-                    // Redundant copy (or straggler) of a packet we've already taken
-                    // from the buffer: we're fine, just ignore it — don't re-buffer
-                    // it and don't count it late.
+                    // Redundant copy (or straggler) of a packet already taken from
+                    // the buffer: ignore it — don't re-buffer or count it late.
                     if bs.consumed_seq.is_some_and(|cs| pkt.seq <= cs) {
                         continue;
                     }
-                    // Timeline-shift detection: a packet with a newer seq but an
-                    // earlier play time than the newest we've seen means the
-                    // source re-anchored (or its lead shrank). Every buffered
-                    // packet scheduled at or after this new time belongs to the
-                    // abandoned timeline and would play out of order — drop them.
+                    // Timeline-shift detection: a newer seq with an earlier play
+                    // time than the newest seen means the source re-anchored. Every
+                    // buffered packet at or after this new time is stale — drop it.
                     if let Some((newest_seq, newest_play_at)) = bs.newest
                         && pkt.seq > newest_seq
                         && pkt.play_at_ms < newest_play_at

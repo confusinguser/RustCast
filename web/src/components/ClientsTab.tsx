@@ -14,18 +14,16 @@ import { tip } from "../tooltip";
 import { clientStatus, sourceStatus } from "../lib/status";
 import type { CatalogSource, Client, ClientStats, Group, ServerSource, Status } from "../types";
 
-// The Clients board has three wired columns: clients, groups, and sources. A
-// client connects to a source directly or through a group, and a group connects
-// to a source. You wire things up by dragging a line from one card onto another.
+// Clients board: three wired columns (clients, groups, sources). A client links
+// to a source directly or via a group; wire cards by dragging a line between them.
 
 // Reorder animation: framer-motion `layout` on each card, eased in-and-out.
 const LAYOUT_MS = 320;
 const LAYOUT_TX = { layout: { duration: LAYOUT_MS / 1000, ease: "easeInOut" } } as const;
 
 type Pt = { x: number; y: number };
-// "client" drags to a group/source, "group" (right side) drags to a source,
-// "groupIn" (left side) drags to a client to pull it into the group, "source"
-// drags to a client/group (or to empty space, cutting all of its lines).
+// "client"→group/source; "group" (right side)→source; "groupIn" (left side)→
+// client to enlist it; "source"→client/group, or empty space to cut its lines.
 type DragKind = "client" | "group" | "groupIn" | "source";
 type Drag = { kind: DragKind; id: string; originKey: string };
 
@@ -61,9 +59,8 @@ function Node({
 }
 
 // ---- purely-logical vertical ordering ------------------------------------
-// Order each column from the connection graph alone (no measured geometry): a
-// barycenter sweep pulls each card toward the average slot of what it links to,
-// unconnected cards and empty groups sink to the bottom, ties keep prior order.
+// Order each column from the graph alone (no geometry): a barycenter sweep pulls
+// each card toward the mean slot of what it links to; unconnected sink, ties hold.
 function computeOrder(
   clients: Client[],
   groups: Group[],
@@ -629,9 +626,8 @@ export function ClientsTab({
   );
 }
 
-// One group card. Rename/delete controls fade in on hover. Pressing and moving
-// on the card drags a wire. Its right half acts as the outgoing (to source)
-// node, its left half the incoming node (drop onto a client to enlist it).
+// One group card; rename/delete fade in on hover. Drag from the card: right half
+// is the outgoing (to source) node, left half the incoming node (drop on a client).
 function GroupCard({
   g,
   regDrop,

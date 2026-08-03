@@ -131,11 +131,9 @@ async fn run_receiver(
     Ok(())
 }
 
-/// A librespot [`Sink`] that converts decoded samples to f32 and forwards them
-/// over a channel. librespot writes packets as fast as it decodes and relies on
-/// the sink blocking to pace playback (a real audio backend blocks on the
-/// device). We have no such device here, so the sink paces itself to realtime;
-/// otherwise librespot would decode an entire track instantly.
+/// A librespot [`Sink`] converting decoded samples to f32 and forwarding them
+/// over a channel. librespot relies on the sink blocking to pace playback; with
+/// no real device, it paces itself to realtime so a track isn't decoded at once.
 struct ChannelSink {
     tx: Sender<Vec<f32>>,
     // The wall-clock time by which the next packet should have been emitted.

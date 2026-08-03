@@ -1,22 +1,21 @@
-//! Live telemetry. Client devices measure their own buffers and sample flow into
-//! lock-free [`DeviceMetrics`] and stream periodic [`TelemetryReport`]s over TCP
-//! to every server they know; each server records its per-source send path in
-//! [`ServerMetrics`] and keeps a short history in a [`TelemetryStore`] that the
-//! web UI subscribes to (SSE).
+//! Live telemetry. Clients record buffer/flow stats into lock-free
+//! [`DeviceMetrics`] and stream periodic [`TelemetryReport`]s over TCP to every
+//! server they know; each server records its per-source send path in
+//! [`ServerMetrics`] and keeps a short history in a [`TelemetryStore`] the web UI
+//! subscribes to (SSE).
 //!
-//! Counters are cumulative since process start; gauges are the instantaneous
-//! value at snapshot time. Recording is always lock-free so it never stalls the
-//! audio threads.
+//! Counters are cumulative since process start; gauges are the value at snapshot
+//! time. Recording is lock-free so it never stalls the audio threads.
 //!
-//! Source ids are 64-bit and are serialized to JSON as *strings*, because they
-//! exceed JavaScript's safe-integer range (2^53).
+//! Source ids are 64-bit, serialized to JSON as strings since they exceed
+//! JavaScript's safe-integer range (2^53).
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -66,11 +65,11 @@ pub struct DeviceMetrics {
     last_rtt_bits: AtomicU64,
     rtt_bits: AtomicU64,
     sync_samples: AtomicU32,
-    /// Estimated delay from the source (ms), stored as f64 bits. Updated on each
-    /// append from the projected play time of the just-queued audio.
+    /// Estimated delay from the source (ms), stored as f64 bits; from the
+    /// projected play time of the just-queued audio.
     source_delay_bits: AtomicU64,
     /// Duration of one packet/buffer in ms (f64 bits), for converting buffer
-    /// depths to milliseconds in the UI.
+    /// depths to ms in the UI.
     packet_ms_bits: AtomicU64,
 }
 
@@ -80,7 +79,7 @@ impl DeviceMetrics {
     }
 
     /// Record the current stream format, so reports can carry it (lets the UI
-    /// convert buffer depths to milliseconds). Updated on every source switch.
+    /// convert buffer depths to ms).
     pub fn set_format(&self, sample_rate: u32, channels: u16) {
         self.sample_rate.store(sample_rate, Ordering::Relaxed);
         self.channels.store(channels as u32, Ordering::Relaxed);
@@ -140,8 +139,8 @@ impl DeviceMetrics {
             .store(ms.to_bits(), Ordering::Relaxed);
     }
 
-    /// Record the current per-packet duration in ms, so the UI can convert the
-    /// jitter-buffer / output-queue depths from packet counts to milliseconds.
+    /// Record the current per-packet duration in ms, so the UI can convert
+    /// jitter-buffer / output-queue depths from packet counts to ms.
     pub fn set_packet_ms(&self, ms: f64) {
         self.packet_ms_bits.store(ms.to_bits(), Ordering::Relaxed);
     }
@@ -173,9 +172,9 @@ impl DeviceMetrics {
         self.sync_samples.store(samples, Ordering::Relaxed);
     }
 
-    /// A wire snapshot of all current values, stamped with the local clock. The
-    /// client-owned settings fields (selected source / volume / delay) are left
-    /// at defaults here and filled by the telemetry sender from [`ClientSettings`].
+    /// A wire snapshot of all current values, stamped with the local clock.
+    /// Client-owned settings (selected source / volume / delay) are left at
+    /// defaults here and filled by the telemetry sender from [`ClientSettings`].
     pub fn snapshot(&self) -> TelemetryReport {
         TelemetryReport {
             sent_ms: now_epoch_ms(),
@@ -218,9 +217,9 @@ fn frame(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Client: every `interval_ms`, snapshot `metrics` + the client-owned `settings`
-/// and send the report over a persistent TCP connection to **every** server
-/// currently in the catalog. TCP gives timely, reliable delivery (no multicast
-/// loss); connections are opened lazily and reopened on error. Runs forever.
+/// and send the report over a persistent TCP connection to every server in the
+/// catalog. TCP gives reliable delivery; connections are opened lazily and
+/// reopened on error. Runs forever.
 pub fn run_telemetry_sender(
     settings: Arc<ClientSettings>,
     metrics: Arc<DeviceMetrics>,
@@ -287,6 +286,9 @@ pub struct ServerMetrics {
     sample_rate: AtomicU32,
     channels: AtomicU32,
     lead_ms: AtomicU32,
+    /// Whether the source is currently producing non-silent audio (vs. silent
+    /// only because nobody is listening).
+    has_audio: AtomicBool,
 }
 
 impl ServerMetrics {
@@ -322,6 +324,11 @@ impl ServerMetrics {
         self.pending_len.store(n as u32, Ordering::Relaxed);
     }
 
+    /// Whether the source is currently producing non-silent audio.
+    pub fn set_has_audio(&self, on: bool) {
+        self.has_audio.store(on, Ordering::Relaxed);
+    }
+
     /// A timestamped sample of the current values, for the history ring.
     pub fn snapshot(&self) -> ServerSample {
         ServerSample {
@@ -330,6 +337,7 @@ impl ServerMetrics {
             frames_sent: self.frames_sent.load(Ordering::Relaxed),
             reanchors: self.reanchors.load(Ordering::Relaxed),
             pending_len: self.pending_len.load(Ordering::Relaxed),
+            has_audio: self.has_audio.load(Ordering::Relaxed),
         }
     }
 
@@ -344,7 +352,7 @@ impl ServerMetrics {
     }
 }
 
-/// One timestamped client telemetry sample kept in the server's history ring.
+/// One timestamped client telemetry sample in the server's history ring.
 /// `t` is the server-receive time (epoch ms) — the graph's shared x-axis.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ClientSample {
@@ -367,7 +375,7 @@ pub struct ClientSample {
     /// Estimated delay from the source (ms) at report time; ≈ the delay setting
     /// in steady state.
     pub source_delay_ms: f64,
-    /// Per-packet duration (ms); multiply by the buffer depths for ms readouts.
+    /// Per-packet duration (ms); multiply by buffer depths for ms readouts.
     pub packet_ms: f64,
 }
 
@@ -379,6 +387,8 @@ pub struct ServerSample {
     pub frames_sent: u64,
     pub reanchors: u64,
     pub pending_len: u32,
+    /// Whether the source was producing non-silent audio at sample time.
+    pub has_audio: bool,
 }
 
 struct ClientHistory {
@@ -388,9 +398,9 @@ struct ClientHistory {
     output_channels: u16,
     last_report_ms: u64,
     /// Highest client-clock send time seen, to drop out-of-order/duplicate
-    /// reports (multicast can deliver in bursts / reorder).
+    /// reports.
     last_sent_ms: u64,
-    /// Current source IP of the client (for targeting control commands).
+    /// Current IP of the client (for targeting control commands).
     ip: Ipv4Addr,
     /// Device hostname reported by the client (the default display name).
     hostname: String,
@@ -422,7 +432,7 @@ pub struct ServerSourceStats {
     pub channels: u16,
     pub lead_ms: u32,
     /// Redundant copies per packet and the last-copy lead (send-timing sliders).
-    /// Meaningful for local sources; 0 for remote (not controllable from here).
+    /// Meaningful for local sources; 0 for remote.
     pub redundancy: u32,
     pub last_lead_ms: u64,
     /// Whether this source streams by unicast to listeners (local sources only).
@@ -432,8 +442,8 @@ pub struct ServerSourceStats {
     pub samples: Vec<ServerSample>,
 }
 
-/// Metadata for one source the UI should show a send-path card for. Built by the
-/// caller from the catalog, so it spans local and remote servers.
+/// Metadata for one source the UI shows a send-path card for. Built from the
+/// catalog, so it spans local and remote servers.
 pub struct SourceMeta {
     pub id: u64,
     pub name: String,
@@ -468,9 +478,9 @@ pub struct ClientSummary {
     pub channel_map: Vec<i16>,
 }
 
-/// Server-side ring buffers of recent telemetry, keyed by client IP, plus the
-/// per-source server send-path history. Fed by the telemetry receiver and a
-/// periodic server-metrics sampler; read by the HTTP `/api/*` handlers.
+/// Server-side ring buffers of recent telemetry (keyed by client device id) plus
+/// the per-source send-path history. Fed by the telemetry receiver and a periodic
+/// server-metrics sampler; read by the HTTP `/api/*` handlers.
 pub struct TelemetryStore {
     /// Keyed by client device id (the `--id` value, else MAC hex).
     clients: Mutex<HashMap<String, ClientHistory>>,
@@ -486,7 +496,7 @@ impl TelemetryStore {
     }
 
     /// Record a report received from `ip` at server time `recv_ms`, keyed by the
-    /// client's MAC.
+    /// client's device id.
     pub fn push_client(&self, ip: Ipv4Addr, report: TelemetryReport, recv_ms: u64) {
         let mut map = self.clients.lock().unwrap();
         let hist = map
@@ -510,10 +520,10 @@ impl TelemetryStore {
             return;
         }
         hist.last_sent_ms = report.sent_ms;
-        // Plot each sample at the client's *send* time, mapped onto the server
+        // Plot each sample at the client's send time, mapped onto the server
         // clock via the reported offset. The client sends at an even 10 Hz, so
-        // this spaces samples evenly regardless of multicast delivery jitter
-        // (receive-time spacing is bursty over a real network → choppy graphs).
+        // samples space evenly regardless of delivery jitter (receive-time
+        // spacing is bursty over a real network → choppy graphs).
         let disp_t = (report.sent_ms as f64 + report.clock_offset_ms).max(0.0) as u64;
         hist.sample_rate = report.sample_rate;
         hist.channels = report.channels;
@@ -649,9 +659,8 @@ impl Default for TelemetryStore {
 }
 
 /// Server: accept client telemetry over TCP on [`TELEMETRY_PORT`] and record it
-/// into `store`, keyed by the connection's source IP. Each client keeps a
-/// persistent connection and streams length-prefixed [`TelemetryReport`]s.
-/// Runs forever; intended for a thread.
+/// into `store`. Each client keeps a persistent connection and streams
+/// length-prefixed [`TelemetryReport`]s. Runs forever; intended for a thread.
 pub fn run_telemetry_receiver(store: Arc<TelemetryStore>) {
     let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, TELEMETRY_PORT)) {
         Ok(l) => l,
@@ -730,6 +739,7 @@ pub fn run_stats_broadcaster(server_id: u64, sources: SamplerProvider, iface: Ip
                     frames_sent: s.frames_sent,
                     reanchors: s.reanchors,
                     pending_len: s.pending_len,
+                    has_audio: s.has_audio,
                 }
             })
             .collect();
@@ -747,7 +757,7 @@ pub fn run_stats_broadcaster(server_id: u64, sources: SamplerProvider, iface: Ip
 
 /// Server: receive other servers' stats broadcasts into `store` so their streams
 /// graph alongside the local ones. Own broadcasts (matching `my_server_id`) are
-/// ignored — the local sampler already records them at full rate. Runs forever.
+/// ignored — the local sampler records them at full rate. Runs forever.
 pub fn run_stats_receiver(store: Arc<TelemetryStore>, my_server_id: u64, iface: Ipv4Addr) {
     let sock = match bind_reuse(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, STATS_PORT)) {
         Ok(s) => s,
@@ -779,6 +789,7 @@ pub fn run_stats_receiver(store: Arc<TelemetryStore>, my_server_id: u64, iface: 
                                 frames_sent: st.frames_sent,
                                 reanchors: st.reanchors,
                                 pending_len: st.pending_len,
+                                has_audio: st.has_audio,
                             },
                         );
                     }

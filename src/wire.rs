@@ -2,16 +2,14 @@
 //!
 //! There are four multicast planes plus one unicast one:
 //! - **Audio** (server → clients): one bincode [`AudioPacket`] per datagram, sent
-//!   to a per-source group on the shared [`AUDIO_PORT`]. Each packet carries the
-//!   absolute wall-clock time at which its samples should begin playing, so every
-//!   client renders the same sample at the same instant (clocks NTP-synced).
+//!   to a per-source group on the shared [`AUDIO_PORT`]. Each carries the wall-clock
+//!   time to start playing, so all NTP-synced clients render in lockstep.
 //! - **Catalog** (server → everyone, [`ANNOUNCE_GROUP`]): each server periodically
 //!   multicasts its [`CatalogAnnounce`] so clients and other servers learn the full
 //!   set of available sources across the LAN.
-//! - **Telemetry** (clients → servers, TCP on [`TELEMETRY_PORT`]): each client
-//!   keeps a persistent TCP connection to every server it hears in the catalog and
-//!   streams length-prefixed [`TelemetryReport`]s. TCP gives timely, reliable
-//!   delivery (no multicast loss); the browser subscribes to the server via SSE.
+//! - **Telemetry** (clients → servers, TCP on [`TELEMETRY_PORT`]): each client keeps
+//!   a persistent connection to every server it hears and streams length-prefixed
+//!   [`TelemetryReport`]s; the browser subscribes to the server via SSE.
 //! - **Control** (server → clients, [`CONTROL_GROUP`]): the web UI mutates a client's
 //!   settings by multicasting a [`ControlCommand`]; the client applies it and reflects
 //!   the new value in its next telemetry report.
@@ -136,19 +134,16 @@ pub struct AudioPacket {
     pub format: WireFormat,
     /// PCM samples encoded per `format`, interleaved across `channels`.
     pub data: Vec<u8>,
-    /// The source-channel index of each channel carried in `data`, in order.
-    /// Empty ⇒ `data` holds every source channel contiguously (0..channels) — the
-    /// multicast / full-stream case. In unicast mode a client that only maps a
-    /// subset of source channels is sent just those, saving bandwidth; this lists
-    /// which ones so the client can route them back by original source index.
+    /// Source-channel index of each channel in `data`, in order. Empty ⇒ `data`
+    /// holds all source channels (0..channels), the full-stream case. In unicast
+    /// mode only a client's mapped channels are sent; this lists which, for routing.
     #[serde(default)]
     pub channel_ids: Vec<u16>,
 }
 
-/// NTP-style time-sync request sent by a client to the server (unicast). Also
-/// carries the client's currently-selected source, so the owning server learns
-/// its listeners (and their IPs) from the always-on sync traffic — used to stop
-/// idle sources and to target unicast mode.
+/// NTP-style time-sync request a client sends the server (unicast). Also carries
+/// the selected source, so the server learns its listeners (and IPs) from sync
+/// traffic — used to stop idle sources and to target unicast mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeRequest {
     /// Client's local clock (epoch ms) at send time (T1).
@@ -157,10 +152,9 @@ pub struct TimeRequest {
     pub nonce: u64,
     /// The source this client is currently playing (0 = none).
     pub selected_source_id: u64,
-    /// The client's current output channel map (one source-channel index per
-    /// output channel; `-1` = silence; empty = default identity). The owning
-    /// server uses it to stream only the source channels this client actually
-    /// plays when in unicast mode. Empty ⇒ send the full stream.
+    /// Client's output channel map (one source-channel index per output channel;
+    /// `-1` = silence; empty = identity/full stream). In unicast mode the server
+    /// uses it to stream only the channels this client plays.
     #[serde(default)]
     pub channel_map: Vec<i16>,
 }
@@ -226,6 +220,9 @@ pub struct SourceStat {
     pub frames_sent: u64,
     pub reanchors: u64,
     pub pending_len: u32,
+    /// Whether the source is currently producing non-silent audio.
+    #[serde(default)]
+    pub has_audio: bool,
 }
 
 /// A server's periodic broadcast of its sources' send-path stats on
@@ -238,9 +235,8 @@ pub struct StatsBroadcast {
 }
 
 /// A settings change targeting one client, multicast by a server's web UI on
-/// [`CONTROL_GROUP`]. The client is the source of truth: it applies the command
-/// and reflects the new value in its next [`TelemetryReport`], which is how every
-/// server's UI converges without server-to-server state sync.
+/// [`CONTROL_GROUP`]. The client applies it and reflects the new value in its next
+/// [`TelemetryReport`], so every server's UI converges without server-to-server sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlCommand {
     /// Which client this targets (octets). Others ignore it.
@@ -257,11 +253,9 @@ pub struct ControlCommand {
     pub set_channel_map: Option<Vec<i16>>,
 }
 
-/// A telemetry snapshot a client streams to every server over TCP (~10 Hz) so
-/// the web UI can graph each device's buffers and sample flow live. Counters are
-/// cumulative since the client started; gauges are the instantaneous value at
-/// report time. Also carries the client's self-owned settings, since with many
-/// servers no single server owns them.
+/// A telemetry snapshot a client streams to every server over TCP (~10 Hz) so the
+/// UI can graph each device's buffers and flow live. Counters are cumulative;
+/// gauges are instantaneous. Also carries the client's self-owned settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryReport {
     /// Client's local clock (epoch ms) at report time.
@@ -323,10 +317,9 @@ pub struct TelemetryReport {
     pub rtt_ms: f64,
     /// Number of sync samples currently held.
     pub sync_samples: u32,
-    /// Estimated delay from the source, ms: projecting when the most recently
-    /// queued sample will actually play (now + the audio already queued ahead of
-    /// it) and comparing to its `play_at` on the synced server clock. In steady
-    /// state this sits near the client's delay setting.
+    /// Estimated delay from the source, ms: when the most recently queued sample
+    /// will play (now + audio queued ahead) versus its `play_at` on the synced
+    /// server clock. In steady state, near the client's delay setting.
     #[serde(default)]
     pub source_delay_ms: f64,
     /// Duration of one packet/buffer in ms (frames-per-packet ÷ sample rate), so

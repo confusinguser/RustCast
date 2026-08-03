@@ -12,7 +12,7 @@ export const TABS: { id: TabId; icon: IconName; label: string }[] = [
 export function SideNav({ active, onSelect }: { active: TabId; onSelect: (id: TabId) => void }) {
   return (
     <nav className="fixed left-5 top-1/2 -translate-y-1/2 z-40">
-      {/* Solid gray pill (no gradient) that keeps its floating shadow. */}
+      {/* Solid gray pill with a floating shadow. */}
       <div className="flex flex-col gap-3 bg-slate-200 rounded-full p-2 shadow-md">
         {TABS.map((t) => {
           const sel = t.id === active;

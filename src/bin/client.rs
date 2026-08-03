@@ -1,7 +1,6 @@
-//! RustCast client: discover sources from the multicast catalog, play the one
-//! selected for it from the web UI, aligned to each packet's play-at timestamp
-//! so all clients stay in sync. Reports its telemetry (and its own settings) to
-//! every server; applies control commands addressed to it.
+//! RustCast client: discovers catalog sources and plays the one selected for it
+//! from the web UI, aligned to each packet's play-at timestamp so all clients
+//! stay in sync. Reports telemetry to every server and applies its commands.
 //!
 //! Usage: `client [--interface IP] [--server IP] [--id NAME]`
 //! Shell completions: `client completions <bash|zsh|fish|...>`

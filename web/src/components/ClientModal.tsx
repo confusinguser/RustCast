@@ -6,9 +6,8 @@ import { ChannelRouting } from "./ChannelRouting";
 import { clientStatus } from "../lib/status";
 import type { CatalogSource, Client, ClientStats } from "../types";
 
-// Opened from a client card's three-dot button. Shows live buffer/delay
-// telemetry, an inline delay slider, a shortcut to the Buffers tab, and the
-// drag-and-drop channel routing.
+// Client detail modal: live buffer/delay telemetry, an inline delay slider, a
+// shortcut to the Buffers tab, and drag-and-drop channel routing.
 export function ClientModal({
   c,
   st,

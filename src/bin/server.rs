@@ -93,10 +93,9 @@ fn main() {
         }
     }
 
-    // A playback client inside this process, if configured (the server machine
-    // also plays). Reaches its own server over loopback multicast. The ctl lets
-    // the web UI enable one live; `running` starts true when config already has
-    // one so the API won't double-spawn it.
+    // Optional in-process playback client, reaching its own server over loopback
+    // multicast. The ctl lets the web UI enable one live; `running` starts true
+    // when config already has one so the API won't double-spawn it.
     let local_client = config.local_client.clone();
     let local_ctl = Arc::new(LocalClientCtl::new(iface, local_client.is_some()));
 

@@ -1,11 +1,8 @@
 //! Durable per-client settings, persisted to `clients.json`.
 //!
-//! Clients are identified by their MAC address (stable across IP changes and
-//! restarts). Each record holds the volume, delay, and an optional display-name
-//! override (the default name is the device's hostname, reported via telemetry).
-//! The server treats these records as the authority: a [`crate::api`] edit writes
-//! here, and a reconciler pushes the stored values back to a (re)connecting
-//! client, so settings survive client restarts.
+//! Clients are keyed by MAC (stable across IP and restarts). Each record holds
+//! volume, delay, an optional name override (default: hostname), plus source and
+//! group. The server treats them as authoritative, restoring them on reconnect.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

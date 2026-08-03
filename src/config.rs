@@ -183,9 +183,9 @@ impl Config {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {e}")))
     }
 
-    /// Write the config back to `path`. Used to persist send-timing changes made
-    /// from the web UI. Note: this is a serde round-trip, so any comments in the
-    /// original file are not preserved.
+    /// Write the config back to `path`, persisting send-timing changes from the
+    /// web UI. This is a serde round-trip, so comments in the original file are
+    /// not preserved.
     pub fn save(&self, path: &str) -> io::Result<()> {
         let yaml = serde_norway::to_string(self)
             .map_err(|e| io::Error::other(format!("serialize config: {e}")))?;

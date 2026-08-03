@@ -1,13 +1,11 @@
 //! Client groups, persisted to `groups.json`.
 //!
-//! A group is a UI convenience for steering several clients at once: members
-//! all follow the group's chosen source. Membership itself lives on each
-//! [`crate::clients::ClientRecord`] (its `group` field); this store holds the
-//! group's display name and its selected source.
+//! A group steers several clients at once: members follow the group's chosen
+//! source. Membership lives on each [`crate::clients::ClientRecord`]; this store
+//! holds the group's display name and selected source.
 //!
-//! Like a client's source, a group's source is stored by *name*, not numeric
-//! id: source ids are derived from the (ephemeral, per-boot) server id and so
-//! change across restarts, whereas the name is stable.
+//! A group's source is stored by *name*, not id: ids derive from the per-boot
+//! server id and change across restarts, whereas the name is stable.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

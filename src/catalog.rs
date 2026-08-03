@@ -1,10 +1,9 @@
 //! Source catalog: servers advertise the sources they host; clients and other
 //! servers listen to build a global, live view of every source on the LAN.
 //!
-//! Everything is multicast on [`ANNOUNCE_GROUP`]. A server sends its own catalog
-//! with `set_multicast_loop_v4(true)`, so it also receives its own announcement
-//! and its sources land in the same [`CatalogStore`] as remote ones — the web UI
-//! then renders local and remote sources uniformly.
+//! Everything is multicast on [`ANNOUNCE_GROUP`]. A server enables multicast
+//! loopback, so its own sources land in the same [`CatalogStore`] as remote ones
+//! and the UI renders both uniformly.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -144,9 +143,8 @@ impl Default for CatalogStore {
 }
 
 /// Build this server's current [`CatalogAnnounce`], reading each source's live
-/// `lead_ms` from its [`SendParams`]. `server_ip` is left 0; the receiver fills
-/// it from the datagram's source address. Shared by the announcer and the
-/// unicast catalog responder.
+/// `lead_ms` from its [`SendParams`]. `server_ip` is left 0 for the receiver to
+/// fill from the datagram's source address.
 pub fn build_announce(
     server_id: u64,
     sync_port: u16,
@@ -169,10 +167,9 @@ pub fn build_announce(
     }
 }
 
-/// Server: multicast this server's catalog every [`ANNOUNCE_INTERVAL_MS`]. Each
-/// source's `lead_ms` is read live from its [`SendParams`], so a lead adjusted
-/// from the UI propagates to clients on the next announcement. Runs forever;
-/// intended for its own thread.
+/// Server: multicast this server's catalog every [`ANNOUNCE_INTERVAL_MS`], with
+/// each source's `lead_ms` read live so UI adjustments propagate on the next
+/// announcement. Runs forever; intended for its own thread.
 pub fn run_catalog_announcer(
     server_id: u64,
     sync_port: u16,
@@ -233,10 +230,9 @@ pub fn run_catalog_responder(server_id: u64, sync_port: u16, sources: EntriesPro
     }
 }
 
-/// Client: when started with `--server <ip>`, periodically fetch that server's
-/// catalog by unicast and merge it into `store`, overriding the announce's
-/// `server_ip` with the known server address. Complements multicast discovery
-/// (both feed the same [`CatalogStore`]). Runs forever; intended for its thread.
+/// Client: with `--server <ip>`, periodically fetch that server's catalog by
+/// unicast and merge it into `store` (overriding `server_ip` with the known
+/// address). Complements multicast discovery. Runs forever; its own thread.
 pub fn run_unicast_catalog_client(server_ip: Ipv4Addr, store: Arc<CatalogStore>) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(s) => s,

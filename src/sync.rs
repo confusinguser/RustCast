@@ -1,15 +1,12 @@
 //! Client clock synchronization and client-owned settings.
 //!
-//! Multicast audio is one-way (server → clients), so to estimate the owning
-//! server's clock a client opens a *unicast* side-channel and does an NTP-style
-//! round-trip exchange. [`SyncedClock`] turns those measurements into a smooth,
-//! continuously-corrected estimate that playback schedules against.
+//! Multicast audio is one-way, so to estimate the owning server's clock a client
+//! opens a *unicast* NTP-style round-trip side-channel. [`SyncedClock`] smooths
+//! those measurements into a continuously-corrected estimate playback schedules against.
 //!
-//! With many servers, no single server owns a client's settings, so the client
-//! owns them itself in [`ClientSettings`] (selected source, volume, delay). The
-//! web UI mutates them by multicasting a [`ControlCommand`]; the client applies
-//! it and reflects the new value in its telemetry. The sync exchange re-points
-//! to whichever server owns the currently-selected source via [`SyncTarget`].
+//! No single server owns a client's settings, so the client owns them in
+//! [`ClientSettings`] (source, volume, delay); the UI mutates them via a multicast
+//! [`ControlCommand`], and the sync exchange re-points to the selected source's server.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, UdpSocket};
@@ -111,10 +108,9 @@ impl SyncedClock {
             s.target_offset_ms = best.offset_ms;
         }
 
-        // Don't apply an offset (or let playback start) until the full warmup
-        // window is collected: a single early sample can be badly skewed, and
-        // adopting it would jump playback. Once WARMUP_SAMPLES are in, adopt the
-        // best (lowest-RTT) estimate directly, then slew from there.
+        // Don't apply an offset (or start playback) until the full warmup window is
+        // collected: a single early sample can be badly skewed and would jump playback.
+        // Then adopt the best (lowest-RTT) estimate directly and slew from there.
         if !s.initialized && s.samples.len() >= WARMUP_SAMPLES {
             s.applied_offset_ms = s.target_offset_ms;
             s.last_local_ms = now_epoch_ms() as f64;
@@ -151,10 +147,9 @@ impl SyncedClock {
         }
     }
 
-    /// Best estimate of the server's current clock (epoch ms, fractional). Each
-    /// call advances the applied offset toward the target by at most
-    /// `MAX_SLEW_FRACTION` of the elapsed time, so the correction is spread out
-    /// and never causes an audible jump.
+    /// Best estimate of the server's current clock (epoch ms, fractional). Each call
+    /// advances the applied offset toward the target by at most `MAX_SLEW_FRACTION` of
+    /// the elapsed time, so the correction spreads out and never causes an audible jump.
     pub fn server_now_ms(&self) -> f64 {
         let mut s = self.state.lock().unwrap();
         let local = now_epoch_ms() as f64;
@@ -359,10 +354,9 @@ impl Default for ClientSettings {
     }
 }
 
-/// Client side: repeatedly exchange timestamps with the server that owns the
-/// currently-selected source (from `target`) and feed the results into `clock`.
-/// When the target server changes, the clock is reset (offsets are per-server).
-/// Runs forever; intended for its own thread.
+/// Client side: repeatedly exchange timestamps with the server owning the selected
+/// source (from `target`), feeding results into `clock`; resets the clock when the
+/// target server changes (offsets are per-server). Runs forever on its own thread.
 pub fn run_client_sync(
     target: Arc<SyncTarget>,
     clock: Arc<SyncedClock>,
@@ -452,10 +446,9 @@ struct Listener {
     channel_map: Vec<i16>,
 }
 
-/// Which clients are currently listening to each local source, learned from the
+/// Which clients are listening to each local source, learned from the
 /// `selected_source_id` (and channel map) on their time-sync requests. Lets the
-/// server stop an unheard source, target unicast mode, and — in unicast mode —
-/// send each client only the channels it plays.
+/// server stop unheard sources, target unicast, and send each client only its channels.
 pub struct Listeners {
     inner: Mutex<HashMap<u64, HashMap<Ipv4Addr, Listener>>>,
 }

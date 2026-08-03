@@ -1,7 +1,6 @@
-//! Small UDP socket helpers that `std::net` doesn't expose: pinning the
-//! multicast egress interface, and binding with address reuse so several
-//! processes on one host can share a multicast port (needed to run multiple
-//! servers, or a co-located server and client, on one box for testing).
+//! Small UDP socket helpers `std::net` doesn't expose: pinning the multicast
+//! egress interface, and binding with address reuse so several processes on one
+//! host can share a multicast port (multiple servers, or server + client).
 
 use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -31,9 +30,8 @@ pub fn set_multicast_if(socket: &UdpSocket, iface: Ipv4Addr) -> std::io::Result<
 }
 
 /// Bind a UDP socket with `SO_REUSEADDR`/`SO_REUSEPORT` set first, so multiple
-/// listeners can share a multicast group/port on one host. `std::net` binds
-/// immediately and gives no hook to set these beforehand, so we build the
-/// socket by hand.
+/// listeners can share a multicast group/port on one host. `std::net` gives no
+/// hook to set these before binding, so we build the socket by hand.
 pub fn bind_reuse(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);

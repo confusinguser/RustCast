@@ -6,10 +6,9 @@ pub mod network;
 pub mod pipe;
 pub mod pulse;
 
-/// Wait up to `timeout` for `fd` to become readable. Returns `Ok(true)` if it is
-/// (data ready, EOF, or hangup — all of which make a subsequent read return
-/// promptly), `Ok(false)` on timeout. Lets fd-backed sources honor a timeout so
-/// their read loop can periodically check a stop flag (used for hot-removal).
+/// Wait up to `timeout` for `fd` to become readable. `Ok(true)` if it is (data
+/// ready, EOF, or hangup — all make a subsequent read return promptly),
+/// `Ok(false)` on timeout, so a read loop can periodically check a stop flag.
 pub(crate) fn poll_readable(fd: i32, timeout: Duration) -> io::Result<bool> {
     let mut pfd = libc::pollfd {
         fd,
@@ -43,10 +42,8 @@ pub trait AudioSource {
     /// May block until samples are available.
     fn next_samples(&mut self) -> io::Result<Option<Vec<f32>>>;
 
-    /// Like [`AudioSource::next_samples`] but bounded by `duration`: returns
-    /// `Ok(Some(_))` with whatever samples are ready (possibly an empty vec if the
-    /// timeout elapsed with no new data), and `Ok(None)` only on real end of
-    /// stream. The bounded wait lets the caller's loop periodically check a stop
-    /// flag so a source can be torn down promptly.
+    /// Like [`AudioSource::next_samples`] but bounded by `duration`: `Ok(Some(_))`
+    /// with whatever samples are ready (an empty vec if the timeout elapsed),
+    /// `Ok(None)` only on real end of stream. Lets the caller check a stop flag.
     fn next_samples_timeout(&mut self, duration: Duration) -> io::Result<Option<Vec<f32>>>;
 }

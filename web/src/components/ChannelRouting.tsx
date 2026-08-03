@@ -2,13 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CatalogSource, Client } from "../types";
 
 // Per-output-channel routing. `channel_map[out] = srcChannel` (-1 = silence).
-//
-// Each source channel has a node on its right edge and each output channel a
-// node on its left edge. The user wires them by dragging a line: grab a source
-// node (or its box) to pull a fresh line to the cursor, or grab an output node
-// (or its box) to pick up the line already connected there. Dropping on an
-// output connects, and dropping on empty space disconnects. The dropdown beside
-// each output does the same thing without dragging.
+// Drag from a source node (right edges) or an output node (left edges): drop on an
+// output to connect, on empty space to disconnect. The per-output dropdown does the same.
 type Pt = { x: number; y: number };
 
 export function ChannelRouting({

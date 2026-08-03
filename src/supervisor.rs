@@ -1,8 +1,7 @@
-//! Runtime source supervisor: owns the set of live sources and lets them be
-//! added and removed while the server runs (hot-reload from the web UI). Each
-//! source runs its own [`run_source_stream`] thread with a stop flag; the
-//! catalog announcer, stats samplers, and HTTP API all read the current set from
-//! here, so a change takes effect immediately without a restart.
+//! Runtime source supervisor: owns the live sources, added/removed while the
+//! server runs (hot-reload from the web UI). Each runs its own
+//! [`run_source_stream`] thread; the announcer, stats samplers, and HTTP API
+//! read the current set here, so changes take effect without a restart.
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;

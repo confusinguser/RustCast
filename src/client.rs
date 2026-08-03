@@ -1,10 +1,9 @@
-//! The client playback stack as a library function, so it runs both as the
-//! `client` binary and in-process inside a server (`local_client` in the config).
+//! The client playback stack as a library function: runs as the `client` binary
+//! and in-process inside a server (`local_client` in the config).
 //!
-//! It discovers sources from the multicast catalog, plays the one selected for it
-//! from the web UI aligned to each packet's play-at timestamp, routes source
-//! channels to the output device's channels per the client-owned channel map,
-//! and streams telemetry (with its own settings) to every server over TCP.
+//! Discovers sources from the multicast catalog, plays the UI-selected one aligned
+//! to each packet's play-at timestamp, routes source channels to the output device
+//! per the client-owned channel map, and streams telemetry to every server over TCP.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::num::NonZero;
@@ -28,11 +27,9 @@ use crate::wire::{ANNOUNCE_PORT, AUDIO_PORT, CONTROL_GROUP, CONTROL_PORT, Contro
 const TELEMETRY_INTERVAL_MS: u64 = 100; // ~10 Hz
 /// Small cpal device buffer to keep output-side latency low.
 const DEVICE_BUFFER_FRAMES: u32 = 512; // ~11ms at 44.1 kHz
-/// Target depth of the realtime player queue. This is the *only* thing the
-/// cushion controls: how much decoded audio sits in the output queue (for jitter
-/// absorption on the output side). The rest of the delay budget stays in the
-/// network jitter buffer. The total latency is fixed by the delay setting, not
-/// by this value.
+/// Target depth of the realtime player queue: how much decoded audio sits in the
+/// output queue for output-side jitter absorption. The rest of the delay budget
+/// stays in the network jitter buffer; total latency is fixed by the delay setting.
 const TARGET_PLAY_QUEUE_MS: f64 = 60.0;
 /// A chunk within this many ms of its target play time is treated as on time.
 const LATE_LEEWAY_MS: f64 = 3.0;
@@ -172,11 +169,9 @@ pub fn run_client(
     // Tracks whether we've fed anything, so a never-yet-fed empty queue isn't
     // miscounted as an underrun.
     let mut started = false;
-    // Server-clock time (ms) at which the audio currently in the player queue will
-    // finish playing — i.e. when a freshly appended chunk would begin. `None` when
-    // the queue is (or has drained) empty. This is our model of the output queue,
-    // used to place each chunk so it plays at exactly its target time and to keep
-    // the queue near CUSHION_MS deep.
+    // Server-clock time (ms) at which the queued audio finishes playing — i.e. when
+    // a freshly appended chunk would begin; `None` when the queue is empty. Our model
+    // of the output queue, used to place each chunk at its target time.
     let mut queue_end_ms: Option<f64> = None;
     // Runs forever: next_samples() only returns None if the receive socket dies.
     loop {
@@ -288,24 +283,16 @@ struct Placement {
     new_queue_end: f64,
 }
 
-/// Decide how to place a chunk of `dur` ms whose first sample should play at
-/// `target` (server-clock ms) into a realtime player queue that currently ends at
-/// `queue_end` (`None` = empty), keeping the queue about `cushion` ms deep.
-///
-/// The queue plays FIFO at realtime, so an appended chunk plays right after the
-/// audio already queued: at `queue_end` if the queue is non-empty, else whenever
-/// we append. That fixes the play time regardless of *when* we append, so the
-/// only ways to change latency are to wait (let the queue drain / delay the start)
-/// or to crop/drop (shed audio when the queue runs later than the target). `now`
-/// is the current server clock; sleeps are capped at `max_sleep`.
+/// Place a `dur`-ms chunk whose first sample should play at `target` (server-clock
+/// ms) into the FIFO player queue ending at `queue_end` (`None` = empty), ~`cushion`
+/// ms deep. Queue plays at realtime, so only waiting or cropping/dropping shifts latency.
 #[allow(clippy::too_many_arguments)]
 fn schedule_chunk(now: f64, target: f64, dur: f64, queue_end: Option<f64>) -> Placement {
     // Where this chunk begins playing, and how long to wait before appending.
     let (wait, start) = match queue_end {
-        // Queue still has audio, and it ends at/after this chunk's target: append
-        // right after it (plays at `qe`), paced so the queue drains toward the
-        // cushion first. Appending later doesn't change the play time, so waiting
-        // only bounds the queue depth.
+        // Queued audio ends at/after this chunk's target: append right after it
+        // (plays at `qe`), paced to drain toward the cushion first. Appending later
+        // doesn't change play time, so waiting only bounds the queue depth.
         Some(qe) if qe > now + LATE_LEEWAY_MS && qe >= target - LATE_LEEWAY_MS => (
             (qe - TARGET_PLAY_QUEUE_MS - now).clamp(0.0, MAX_SLEEP_MS),
             qe,
@@ -350,16 +337,13 @@ fn schedule_chunk(now: f64, target: f64, dur: f64, queue_end: Option<f64>) -> Pl
     }
 }
 
-/// Route interleaved `samples` (`src_ch` channels physically present) into a new
-/// interleaved buffer of `out_ch` channels. `map` holds one *source*-channel index
-/// per output channel (`-1`, or out of range, = silence); an empty `map` is the
-/// default identity mapping (output channel i plays source channel i).
+/// Route interleaved `samples` (`src_ch` channels present) into a new `out_ch`-wide
+/// interleaved buffer. `map` holds one source-channel index per output channel
+/// (`-1`/out-of-range = silence); empty `map` = identity (out i ← src i).
 ///
-/// `channel_ids` gives the source-channel index of each channel present in
-/// `samples`, in order; empty means the full contiguous stream (present channel i
-/// is source channel i). In unicast mode the server may send only the subset of
-/// source channels a client plays, so a requested source channel is looked up
-/// through `channel_ids` to its physical position (not present ⇒ silence).
+/// `channel_ids` gives the source-channel index of each present channel, in order
+/// (empty = full contiguous stream). In unicast mode the server may send only the
+/// subset a client plays, so a wanted channel is looked up here (absent ⇒ silence).
 fn remap_channels(
     samples: &[f32],
     src_ch: usize,
@@ -544,10 +528,9 @@ mod tests {
 
     #[test]
     fn late_queue_crops_front() {
-        // Delay was lowered slightly: target is 5000 but the queue still ends at
-        // 5010 (10ms too deep). Crop 10ms off the front so the tail lands on time;
-        // the survivor (meant for 5010) plays at 5010 and the queue-end advances
-        // to target + dur.
+        // Delay lowered slightly: target 5000 but the queue still ends at 5010
+        // (10ms too deep). Crop 10ms off the front so the tail lands on time; the
+        // survivor (meant for 5010) plays at 5010, queue-end advances to target+dur.
         let p = sched(4980.0, 5000.0, 40.0, Some(5010.0));
         assert!(!p.drop);
         assert!((p.crop_ms - 10.0).abs() < 1e-9);

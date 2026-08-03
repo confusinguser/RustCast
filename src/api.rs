@@ -1,8 +1,7 @@
-//! HTTP control plane (Poem). Lists connected clients and the global source
-//! catalog, serves the React UI at `/`, and turns UI edits into multicast
-//! [`ControlCommand`]s. All client state (volume/delay/selected source) is owned
-//! by the clients and read here from their telemetry; this server stores none of
-//! it. Same-origin as the API, so no CORS is needed.
+//! HTTP control plane (Poem). Lists clients and the source catalog, serves the
+//! React UI at `/`, and turns UI edits into multicast [`ControlCommand`]s.
+//! Client state (volume/delay/source) lives on the clients and is read here from
+//! their telemetry, not stored. Same-origin, so no CORS.
 
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,18 +24,18 @@ use crate::supervisor::SourceRegistry;
 use crate::wire::{CONTROL_GROUP, CONTROL_PORT, ControlCommand, MAX_LEAD_MS, WireFormat};
 
 /// The single-page UI, compiled into the binary. Built from the Vite project in
-/// `web/` (`npm run build` inlines all JS + CSS into one self-contained file);
-/// the built artifact is committed so `cargo build` needs no Node toolchain.
+/// `web/`; the committed artifact self-contains all JS + CSS, so `cargo build`
+/// needs no Node toolchain.
 const INDEX_HTML: &str = include_str!("../web/dist/index.html");
 
-/// This server's own id, injected so `/api/stats` can mark which streams are
-/// remote (hosted by another server).
+/// This server's own id, so `/api/stats` can mark which streams are remote
+/// (hosted by another server).
 pub struct LocalServerId(pub u64);
 
 /// Runtime handle for the in-process playback client (see
-/// [`crate::config::LocalClientConfig`]). Lets the web UI enable it live; the
-/// running client can't be cleanly stopped, so disabling/renaming persists to
-/// the config and takes effect on the next restart.
+/// [`crate::config::LocalClientConfig`]). Enables it live; a running client
+/// can't be cleanly stopped, so disabling/renaming persists to the config and
+/// takes effect on the next restart.
 pub struct LocalClientCtl {
     iface: Ipv4Addr,
     running: AtomicBool,
@@ -54,7 +53,7 @@ impl LocalClientCtl {
     /// check-and-set atomic, so concurrent PUTs can't double-spawn.
     fn ensure_running(&self, name: Option<String>) {
         if self.running.swap(true, Ordering::SeqCst) {
-            return; // already running this session
+            return; // already running
         }
         let iface = self.iface;
         let device_id = Some(format!("{}-local", crate::client::hostname()));
@@ -84,8 +83,8 @@ impl ControlSender {
         })
     }
 
-    /// Multicast a command a few times (multicast is lossy; the client dedups by
-    /// the fact that re-applying the same value is a no-op).
+    /// Multicast a command a few times (lossy; re-applying the same value on the
+    /// client is a no-op).
     pub fn send(
         &self,
         target: Ipv4Addr,
@@ -137,8 +136,7 @@ fn format_str(f: WireFormat) -> &'static str {
 
 #[derive(Serialize)]
 struct ClientDto {
-    /// Stable identity (the `--id` value, else MAC hex); the UI keys and
-    /// addresses clients by this.
+    /// Stable identity (`--id` value, else MAC hex); the UI keys clients by this.
     id: String,
     ip: String,
     /// Display name: the override from clients.json, else the device hostname.
@@ -151,15 +149,15 @@ struct ClientDto {
     selected_source_id: String,
     /// Output device channel count (for the routing matrix).
     output_channels: u16,
-    /// Current output channel map (one source-channel index per output channel,
-    /// `-1` = silence). Empty = default identity mapping.
+    /// Output channel map (one source-channel index per output channel, `-1` =
+    /// silence). Empty = default identity mapping.
     channel_map: Vec<i16>,
     /// Group this client belongs to (`null` = ungrouped).
     group_id: Option<String>,
 }
 
 /// A client group, for the Clients board. `source_id` is resolved from the
-/// stored source name to the *current* id ("" = none / not yet in the catalog).
+/// stored source name to the current id ("" = none / not in the catalog).
 #[derive(Serialize)]
 struct GroupDto {
     id: String,
@@ -176,7 +174,7 @@ struct SourceDto {
     sample_rate: u32,
     channels: u16,
     format: String,
-    /// Send lead (ms) — the cap for a client's delay slider when it plays this.
+    /// Send lead (ms) — caps a client's delay slider when it plays this.
     lead_ms: u32,
 }
 
@@ -233,7 +231,7 @@ fn client_dtos(store: &TelemetryStore, clients_store: &ClientStore) -> Vec<Clien
         .into_iter()
         .map(|c| {
             let rec = clients_store.get(&c.id);
-            // Display name: stored override, else the reported hostname.
+            // Stored override, else the reported hostname.
             let name = rec
                 .as_ref()
                 .and_then(|r| r.name.clone())
@@ -341,7 +339,7 @@ fn source_metas(catalog: &CatalogStore, registry: &SourceRegistry, my_id: u64) -
 
 /// One SSE payload. `kind` is "snapshot" (full history, applied fresh) or "delta"
 /// (only samples newer than the client's cursor, appended). Meta (client list +
-/// catalog) is small and included every time so the UI stays current.
+/// catalog) is small and included every time.
 #[derive(Serialize)]
 struct EventPayload {
     #[serde(rename = "type")]
@@ -357,10 +355,9 @@ struct EventPayload {
 type StatsSnapshotServer = crate::metrics::ServerSourceStats;
 type StatsSnapshotClient = crate::metrics::ClientStats;
 
-/// Live stats subscription (Server-Sent Events). On connect the server pushes one
+/// Live stats subscription (Server-Sent Events). On connect, pushes one
 /// `snapshot` with the full ~60 s history, then `delta` events every ~200 ms
-/// carrying only new samples (per-source and per-client cursors) plus fresh meta.
-/// An open connection is the "someone's watching" signal.
+/// carrying only new samples (per-source/per-client cursors) plus fresh meta.
 #[handler]
 fn events(
     Data(store): Data<&Arc<TelemetryStore>>,
@@ -399,7 +396,7 @@ fn events(
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         let metas = source_metas(&st.catalog, &st.registry, st.my_id);
-        let snap = st.store.snapshot(&metas); // full histories
+        let snap = st.store.snapshot(&metas);
 
         // Keep only samples past each cursor, then advance the cursors.
         let mut server = snap.server;
@@ -447,7 +444,7 @@ fn set_volume(
     let v = body.volume.clamp(0.0, 1.0);
     clients_store.set_volume(&id, v); // persist (authoritative)
     if let Some(ip) = store.ip_for_id(&id) {
-        control.send(ip, None, Some(v), None); // push to the client now
+        control.send(ip, None, Some(v), None); // push to the client
     }
     Ok(StatusCode::OK)
 }
@@ -509,7 +506,7 @@ fn set_channel_map(
 ) -> poem::Result<StatusCode> {
     clients_store.set_channel_map(&id, body.map.clone()); // persist (authoritative)
     if let Some(ip) = store.ip_for_id(&id) {
-        control.send_channel_map(ip, body.map); // push to the client now
+        control.send_channel_map(ip, body.map); // push to the client
     }
     Ok(StatusCode::OK)
 }
@@ -563,8 +560,8 @@ fn set_group_name(
     Ok(StatusCode::OK)
 }
 
-/// Point a group at a source (or, with empty/null, at nothing): persist the
-/// choice by name and push the source to every current member.
+/// Point a group at a source (empty/null = nothing): persist the choice by name
+/// and push the source to every current member.
 #[handler]
 fn set_group_source(
     Path(gid): Path<String>,
@@ -599,8 +596,8 @@ fn set_group_source(
     Ok(StatusCode::OK)
 }
 
-/// Move a client into a group (or, with empty/null, out of its group). Joining
-/// a group that already has a source makes the client adopt it immediately.
+/// Move a client into a group (empty/null = out of its group). Joining a group
+/// that already has a source makes the client adopt it immediately.
 #[handler]
 fn set_client_group(
     Path(id): Path<String>,
@@ -618,8 +615,8 @@ fn set_client_group(
         return Err(poem::Error::from_status(StatusCode::NOT_FOUND));
     }
     clients_store.set_group(&id, gid.clone());
-    // A client in a group plays the group's source — which may be nothing, in
-    // which case it falls silent (id 0) rather than keeping its old source.
+    // A grouped client plays the group's source, or falls silent (id 0) if the
+    // group has none — rather than keeping its old source.
     if let Some(g) = &gid
         && let Some(ip) = store.ip_for_id(&id)
     {
@@ -633,9 +630,9 @@ fn set_client_group(
     Ok(StatusCode::OK)
 }
 
-/// Adjust a *local* source's send timing (lead / redundancy / last-copy lead),
-/// applying it live and persisting it to the yaml config. 404 for a source id
-/// this server doesn't host.
+/// Adjust a local source's send timing (lead / redundancy / last-copy lead),
+/// applying it live and persisting to the yaml config. 404 for a source id this
+/// server doesn't host.
 #[handler]
 fn set_send(
     Path(id): Path<String>,
@@ -666,9 +663,9 @@ fn set_send(
     Ok(StatusCode::OK)
 }
 
-/// Manually re-anchor a *local* source's send timeline (resets `start_ms` to now
-/// on its next packet, resyncing it to real time). 404 for a source id this
-/// server doesn't host.
+/// Manually re-anchor a local source's send timeline (resets `start_ms` to now
+/// on its next packet, resyncing to real time). 404 for a source id this server
+/// doesn't host.
 #[handler]
 fn reanchor_source(
     Path(id): Path<String>,
@@ -684,9 +681,9 @@ fn reanchor_source(
     Ok(StatusCode::OK)
 }
 
-/// Rebuild the config's source list from the live registry (folding in the
-/// current send-timing values) and write it to disk. Other config fields
-/// (interface, local client) are preserved.
+/// Rebuild the config's source list from the live registry (with current
+/// send-timing values) and write it to disk. Other fields (interface, local
+/// client) are preserved.
 fn persist_sources(config: &Arc<Mutex<Config>>, cfg_path: &str, registry: &SourceRegistry) {
     let mut cfg = config.lock().unwrap();
     cfg.sources = registry.configs();
@@ -697,7 +694,7 @@ fn persist_sources(config: &Arc<Mutex<Config>>, cfg_path: &str, registry: &Sourc
 
 /// The full server config, for the web-UI config editor. Each source is its flat
 /// config plus its derived `id` (a string, since ids exceed JS safe ints) so the
-/// editor can target the PUT/DELETE endpoints.
+/// editor can target the endpoints.
 #[handler]
 fn get_config(
     Data(config): Data<&Arc<Mutex<Config>>>,
@@ -733,10 +730,9 @@ struct LocalClientBody {
     name: Option<String>,
 }
 
-/// Enable/disable the in-process playback client and set its name. Persists to
-/// the config; enabling starts a player immediately, while disabling or renaming
-/// takes effect on the next server restart (a running client can't be stopped
-/// cleanly).
+/// Enable/disable the in-process playback client and set its name, persisting to
+/// the config. Enabling starts a player immediately; disabling or renaming takes
+/// effect on the next server restart (a running client can't be stopped cleanly).
 #[handler]
 fn set_local_client(
     Data(registry): Data<&Arc<SourceRegistry>>,

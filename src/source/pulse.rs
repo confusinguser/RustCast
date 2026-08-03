@@ -2,16 +2,14 @@
 //! / `pactl` CLIs, yielding interleaved f32 samples.
 //!
 //! Two flavors:
-//! - [`PulseKind::Sink`]: registers a *virtual playback device* (a null sink) that
-//!   apps can select as their output; we capture that sink's `.monitor`, so all
-//!   audio routed to it is streamed. The sink is created on open and removed on
-//!   drop.
-//! - [`PulseKind::Source`]: captures an existing input (microphone / line-in),
-//!   named or the default source.
+//! - [`PulseKind::Sink`]: registers a virtual null sink apps can select as their
+//!   output; we capture its `.monitor`. Created on open, removed on drop.
+//! - [`PulseKind::Source`]: captures an existing input (mic / line-in), named or
+//!   the default source.
 //!
-//! `parec`/`pactl` come with PulseAudio and with PipeWire's pulse compatibility
-//! layer (`pipewire-pulse`), so this works on either. The server process must run
-//! in the user's audio session (with `XDG_RUNTIME_DIR` set) to reach the server.
+//! `parec`/`pactl` ship with PulseAudio and with PipeWire's pulse layer
+//! (`pipewire-pulse`), so this works on either. The server must run in the user's
+//! audio session (`XDG_RUNTIME_DIR` set) to reach the audio server.
 
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -23,11 +21,9 @@ use super::{AudioSource, Format, poll_readable};
 /// `parec` is asked for s16le; we decode that to f32 (as the pipe source does).
 const BYTES_PER_SAMPLE: usize = 2;
 
-/// Capture latency requested from the audio server. Without this, `parec` lets
-/// the server pick, and monitor sources in particular default to a very large
-/// fragment (seconds of buffering) before any audio reaches our stdout pipe.
-/// A small value makes `parec` deliver captured audio promptly; the client-side
-/// jitter buffer (send lead) still absorbs delivery jitter downstream.
+/// Capture latency requested from the audio server. Without it, monitor sources
+/// default to a very large fragment (seconds of buffering) before audio reaches
+/// our pipe; a small value makes `parec` deliver promptly.
 const CAPTURE_LATENCY_MS: u32 = 5;
 
 /// Which audio-server endpoint to capture.
@@ -143,9 +139,8 @@ impl Drop for PulseSource {
 }
 
 /// Ensure a null sink named `sink_name` exists. Returns the id of the module we
-/// created, or `None` if the sink already existed (so we don't unload someone
-/// else's — and so a SIGKILL-orphaned sink is reused across restarts, not
-/// duplicated).
+/// created, or `None` if it already existed — so we don't unload someone else's,
+/// and a SIGKILL-orphaned sink is reused across restarts rather than duplicated.
 fn ensure_null_sink(sink_name: &str, channels: u16) -> io::Result<Option<String>> {
     if sink_exists(sink_name) {
         return Ok(None);

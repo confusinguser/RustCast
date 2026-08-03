@@ -1,10 +1,8 @@
 import type { Client, ClientStats, ServerSource, Status } from "../types";
 import { lastCounterRate } from "./series";
 
-// Live status is derived from telemetry: a device that's connected but whose
-// audio counter isn't advancing reads as "No Audio", one whose counter is
-// advancing reads as "Playing". Telemetry flows continuously while connected,
-// so a stalled counter genuinely means silence (source paused / no source).
+// Status is derived from telemetry: while connected, an advancing audio counter
+// means "Playing" and a stalled one means silence ("No Audio").
 
 /** Playing / No Audio / Error / Offline for a client. `sourceSending` says whether
  *  the client's selected source is actively pushing packets: if it is but the
@@ -21,8 +19,12 @@ export function clientStatus(
   return sourceSending ? "error" : "no-audio";
 }
 
-/** Playing / No Audio / No Listeners for a source. */
+/** Playing / No Audio / No Listeners for a source. No-audio (a silent source)
+ *  takes priority over no-listeners, so a silent idle source reads as No Audio
+ *  even with nobody listening. */
 export function sourceStatus(src: ServerSource, clients: Client[]): Status {
+  const last = src.samples[src.samples.length - 1] as { has_audio?: boolean } | undefined;
+  if (last && last.has_audio === false) return "no-audio";
   const sending = lastCounterRate(src.samples, "packets_sent") > 0;
   if (sending) return "playing";
   const listeners = clients.some(

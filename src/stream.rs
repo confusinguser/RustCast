@@ -1,7 +1,6 @@
-//! One source's server-side send path: read a source, packetize, and multicast
-//! to that source's group on the shared [`AUDIO_PORT`]. Each source runs this on
-//! its own thread with its own timeline anchor and sequence counter, so sources
-//! are fully independent — one ending never disturbs the others.
+//! One source's server-side send path: read, packetize, and multicast to that
+//! source's group on the shared [`AUDIO_PORT`]. Each source runs this on its own
+//! thread with its own timeline anchor and seq counter, so sources are independent.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -32,6 +31,12 @@ pub const MAX_COPIES: u32 = 8;
 const MULTICAST_TTL: u32 = 1;
 /// If the timeline falls this far behind real time, re-anchor it.
 const REANCHOR_TOLERANCE_MS: u64 = 60;
+/// A sample at or below this amplitude counts as silence (≈ one s16 LSB).
+const SILENCE_EPS: f32 = 1.0 / 32768.0;
+/// After this much continuous silence, treat the source as producing no audio
+/// and stop sending (matters most for a sink monitor, which streams digital
+/// zeros while idle).
+const SILENCE_HOLD_MS: u64 = 1000;
 /// Max time a source read blocks before the loop re-checks its stop flag, so a
 /// hot-removed source is torn down promptly (its `Drop` kills `parec` etc.).
 const READ_POLL_MS: u64 = 100;
@@ -104,9 +109,8 @@ impl SendParams {
 }
 
 /// A scheduled redundant copy: send `bytes` (a serialized packet) to `dest` at
-/// wall-clock `at` (epoch ms). Pre-addressed at enqueue time, since a client's
-/// channel subset makes the payload per-destination. Ordered by `at` only, for
-/// the retransmit min-heap.
+/// wall-clock `at` (epoch ms). Pre-addressed at enqueue time since a client's channel
+/// subset makes the payload per-destination. Ordered by `at` only, for the min-heap.
 struct Copy {
     at: u64,
     dest: (Ipv4Addr, u16),
@@ -178,10 +182,9 @@ pub fn open_source(kind: &SourceKind) -> std::io::Result<Box<dyn AudioSource>> {
     }
 }
 
-/// Where a source's packets go right now, each with the channel subset to send
-/// (`None` = the full stream). Multicast mode → the group, full stream. Unicast
-/// mode → each currently-listening client, with only the source channels its
-/// output map plays. Empty ⇒ nobody listening ⇒ send nothing.
+/// Where a source's packets go, each with the channel subset to send (`None` =
+/// full stream). Multicast → the group, full stream. Unicast → each listening
+/// client with only the channels its output map plays. Empty ⇒ nobody listening.
 fn dests(
     params: &SendParams,
     group: Ipv4Addr,
@@ -203,13 +206,12 @@ fn dests(
     }
 }
 
-/// The distinct source channels a client with output `map` actually plays, on a
-/// source with `src_channels` channels — or `None` to send the full stream.
+/// The distinct source channels a client with output `map` plays, on a source with
+/// `src_channels` channels — or `None` to send the full stream.
 ///
-/// `None` when the map is the default identity (empty) or already covers every
-/// source channel: in both cases the full contiguous stream is what's wanted, so
-/// all such clients (and multicast) can share one serialized packet. Otherwise
-/// `Some(sorted, distinct, in-range indices)` — the subset to send.
+/// `None` when the map is identity (empty) or already covers every source channel:
+/// the full contiguous stream is wanted, so those clients (and multicast) share one
+/// serialized packet. Otherwise `Some(sorted, distinct, in-range indices)`.
 fn needed_channels(map: &[i16], src_channels: usize) -> Option<Vec<u16>> {
     if map.is_empty() || src_channels == 0 {
         return None;
@@ -250,11 +252,9 @@ fn select_channels(full: &[f32], src_channels: usize, subset: &[u16]) -> Vec<f32
     out
 }
 
-/// Read `kind` and stream it as timestamped PCM — to the source's multicast
-/// group, or (unicast mode) to each listening client — but only while at least
-/// one client is listening. Runs forever; intended for its own thread. On
-/// end-of-stream (e.g. a FIFO writer closing) the source is reopened rather than
-/// exiting, so it stays available in the catalog.
+/// Read `kind` and stream it as timestamped PCM — to the source's multicast group,
+/// or (unicast) to each listening client — but only while someone is listening. On
+/// end-of-stream the source is reopened, not exited, so it stays in the catalog. Runs forever.
 #[allow(clippy::too_many_arguments)]
 pub fn run_source_stream(
     source_id: u64,
@@ -318,13 +318,15 @@ pub fn run_source_stream(
     );
 
     // Timeline anchor: play_at = start_ms + lead + frames/rate. `start_ms` is
-    // re-anchored to real time whenever the source falls behind (a late start
-    // like Spotify connecting, or a pause/gap), so play_at always stays ~lead in
-    // the future instead of drifting into the past.
+    // re-anchored to real time whenever the source falls behind (late start, pause,
+    // or gap), so play_at stays ~lead in the future instead of drifting into the past.
     let mut start_ms = now_epoch_ms();
     let mut seq: u64 = 0;
     let mut total_frames: u64 = 0;
     let mut pending: Vec<f32> = Vec::with_capacity(samples_per_packet * 2);
+    // Consecutive silent frames seen; drives the silence gate below.
+    let mut silent_frames: u64 = 0;
+    let silence_hold_frames = sample_rate * SILENCE_HOLD_MS / 1000;
 
     loop {
         // Stop promptly when hot-removed (drops the source, running its cleanup).
@@ -386,9 +388,25 @@ pub fn run_source_stream(
                 std::thread::sleep(Duration::from_millis(send_at_ms - now));
             }
 
+            // Silence gate: after a sustained run of silent samples, mark the
+            // source as producing no audio and stop sending; resumes the instant
+            // real audio returns.
+            if chunk.iter().all(|s| s.abs() <= SILENCE_EPS) {
+                silent_frames = silent_frames.saturating_add(frames_per_packet as u64);
+            } else {
+                silent_frames = 0;
+            }
+            let has_audio = silent_frames < silence_hold_frames;
+            metrics.set_has_audio(has_audio);
+
             // Resolve destinations (and, in unicast mode, each client's channel
-            // subset). Only put anything on the wire if someone is listening.
-            let targets = dests(&params, group, source_id, &listeners, channels);
+            // subset). Only put anything on the wire if the source has audio and
+            // someone is listening.
+            let targets = if has_audio {
+                dests(&params, group, source_id, &listeners, channels)
+            } else {
+                Vec::new()
+            };
             if !targets.is_empty() {
                 // Serialize once per distinct channel subset — every full-stream
                 // client and multicast share the `None` entry. Keyed by subset.
@@ -450,22 +468,21 @@ pub fn run_source_stream(
                         }
                     }
                 }
+                // Count only packets actually sent to a listener; advance seq per
+                // emitted packet so a held-back stream resumes gap-free.
+                seq += 1;
+                metrics.record_packet_sent(frames_per_packet as u64);
             }
 
-            seq += 1;
             total_frames += frames_per_packet as u64;
-            metrics.record_packet_sent(frames_per_packet as u64);
             metrics.set_pending_len(pending.len());
         }
     }
 }
 
-/// Companion to [`run_source_stream`]: sends scheduled redundant copies to their
-/// (pre-resolved) destinations at their wall-clock times from a min-heap. Each
-/// copy is addressed at enqueue time — because a client's channel subset makes
-/// the payload per-destination — so a listener change within the short redundancy
-/// window isn't re-resolved; the next fresh packet picks it up. Runs until the
-/// sender drops.
+/// Companion to [`run_source_stream`]: sends scheduled redundant copies from a
+/// min-heap to their pre-resolved destinations at their wall-clock times. A listener
+/// change within the short redundancy window isn't re-resolved; the next packet picks it up.
 fn run_retransmit(socket: Arc<UdpSocket>, rx: mpsc::Receiver<Copy>) {
     let mut heap: BinaryHeap<Reverse<Copy>> = BinaryHeap::new();
     loop {
