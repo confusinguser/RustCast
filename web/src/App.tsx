@@ -8,6 +8,7 @@ import { ClientModal } from "./components/ClientModal";
 import { SourceModal } from "./components/SourceModal";
 import { TooltipHost } from "./tooltip";
 import { lastCounterRate } from "./lib/series";
+import { apiUrl } from "./lib/api";
 import type {
   CatalogSource,
   Client,
@@ -20,7 +21,7 @@ import type {
 
 // PUT a client setting immediately on every change (no debounce).
 function putSetting(id: string, field: string, body: unknown) {
-  fetch(`/api/clients/${id}/${field}`, {
+  fetch(apiUrl(`api/clients/${id}/${field}`), {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -55,7 +56,7 @@ export function App() {
     clients: {},
   });
   useEffect(() => {
-    const es = new EventSource("/api/events");
+    const es = new EventSource(apiUrl("api/events"));
     es.onmessage = (e) => {
       let msg: any;
       try {
@@ -119,24 +120,24 @@ export function App() {
   const onClientGroup = (id: string, groupId: string | null) =>
     putSetting(id, "group", { group_id: groupId });
   const onGroupSource = (gid: string, sourceId: string) => {
-    fetch(`/api/groups/${gid}/source`, {
+    fetch(apiUrl(`api/groups/${gid}/source`), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source_id: sourceId || null }),
     }).catch(() => {});
   };
   const onGroupName = (gid: string, name: string) => {
-    fetch(`/api/groups/${gid}/name`, {
+    fetch(apiUrl(`api/groups/${gid}/name`), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name || null }),
     }).catch(() => {});
   };
   const onCreateGroup = () => {
-    fetch(`/api/groups`, { method: "POST" }).catch(() => {});
+    fetch(apiUrl(`api/groups`), { method: "POST" }).catch(() => {});
   };
   const onDeleteGroup = (gid: string) => {
-    fetch(`/api/groups/${gid}`, { method: "DELETE" }).catch(() => {});
+    fetch(apiUrl(`api/groups/${gid}`), { method: "DELETE" }).catch(() => {});
   };
   const doVolume = useCallback((id: string, v: number) => {
     setVolumes((prev) => ({ ...prev, [id]: v }));
@@ -174,14 +175,14 @@ export function App() {
   const onChannelMap = (id: string, map: number[]) => putSetting(id, "channelmap", { map });
   const onSend = (id: string, patch: Record<string, unknown>) => {
     setSendParams((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } as SendParams }));
-    fetch(`/api/sources/${id}/send`, {
+    fetch(apiUrl(`api/sources/${id}/send`), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
     }).catch(() => {});
   };
   const onReanchor = (id: string) => {
-    fetch(`/api/sources/${id}/reanchor`, { method: "POST" }).catch(() => {});
+    fetch(apiUrl(`api/sources/${id}/reanchor`), { method: "POST" }).catch(() => {});
   };
 
   const statsById: Record<string, ClientStats> = {};

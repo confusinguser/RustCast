@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Icon } from "../icons";
 import { inputCls } from "../theme";
+import { apiUrl } from "../lib/api";
 
 type SourceDraft = Record<string, any>;
 
@@ -88,7 +89,7 @@ function SourcesConfig() {
   const [msg, setMsg] = useState("");
 
   const load = useCallback(() => {
-    fetch("/api/config")
+    fetch(apiUrl("api/config"))
       .then((r) => r.json())
       .then((c) => setSources(c.sources || []))
       .catch(() => setSources([]));
@@ -108,7 +109,7 @@ function SourcesConfig() {
   };
   const save = (s: SourceDraft) => {
     const { id, ...body } = s;
-    fetch(`/api/sources/${id}`, {
+    fetch(apiUrl(`api/sources/${id}`), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -117,7 +118,7 @@ function SourcesConfig() {
       .catch(() => setMsg("network error"));
   };
   const del = (s: SourceDraft) => {
-    fetch(`/api/sources/${s.id}`, { method: "DELETE" })
+    fetch(apiUrl(`api/sources/${s.id}`), { method: "DELETE" })
       .then(() => load())
       .catch(() => {});
   };
@@ -128,7 +129,7 @@ function SourcesConfig() {
     } else setDraft((d) => ({ ...d, [key]: val }));
   };
   const add = () => {
-    fetch("/api/sources", {
+    fetch(apiUrl("api/sources"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(draft),
@@ -190,7 +191,7 @@ function GeneralSettings() {
   const [msg, setMsg] = useState("");
 
   const load = useCallback(() => {
-    fetch("/api/config")
+    fetch(apiUrl("api/config"))
       .then((r) => r.json())
       .then((c) => {
         const lc = c.local_client;
@@ -204,7 +205,7 @@ function GeneralSettings() {
   }, [load]);
 
   const save = (nextEnabled: boolean, nextName: string) => {
-    fetch("/api/config/local_client", {
+    fetch(apiUrl("api/config/local_client"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: nextEnabled, name: nextName || null }),
