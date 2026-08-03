@@ -24,14 +24,6 @@ use crate::wire::AudioPacket;
 /// Cap on buffered packets, so a stalled consumer can't grow memory without
 /// bound. At realtime pacing the buffer holds only ~the server's lead.
 const MAX_BUFFERED: usize = 2000;
-/// How long to wait for a missing in-order packet before treating it as lost.
-const JITTER_WAIT_MS: u64 = 0;
-/// Upper bound on a single play-at sleep, so a bad clock estimate can't wedge
-/// playback for a long time.
-const MAX_SLEEP_MS: u64 = 2000;
-/// Release each packet to the player this many ms *ahead* of its play time, so
-/// the player queue keeps a steady cushion and doesn't underrun on jitter.
-const CUSHION_MS: f64 = 60.0;
 /// How often the selection watcher re-checks the catalog, so a source selected
 /// before its server was heard gets joined once it appears.
 const SELECTION_POLL_MS: u64 = 500;
@@ -51,12 +43,28 @@ pub struct PlayChunk {
     pub channel_ids: Vec<u16>,
 }
 
+impl PlayChunk {
+    pub fn duration_ms(&self) -> u64 {
+        (self.samples.len() as f64 / self.channels as f64 / self.sample_rate as f64 * 1000.0)
+            .round() as u64
+    }
+}
+
 struct BufState {
+    /// Buffered packets keyed by `play_at_ms`. Keying by play time (not seq)
+    /// dedups the server's redundant copies for free — they share a play time.
     packets: BTreeMap<u64, AudioPacket>,
-    /// Next sequence number we expect to play (for the active source).
-    next_seq: u64,
-    /// After a source switch, adopt the earliest buffered seq on the next pull.
-    need_resync: bool,
+    /// The (seq, play_at_ms) of the newest packet seen for the active source.
+    /// Used only to detect a timeline shift: a newer seq scheduled *earlier* than
+    /// this means the source re-anchored (or its lead shrank), so the buffered
+    /// packets from the old timeline can be dropped. `None` until the first
+    /// packet after a (re)selection.
+    newest: Option<(u64, u64)>,
+    /// Highest sequence number already pulled from the buffer. The server sends
+    /// each packet several times for redundancy (same seq); once we've taken one
+    /// copy, later-arriving copies are ignored silently rather than re-buffered
+    /// and counted late. `None` until the first pull after a (re)selection.
+    consumed_seq: Option<u64>,
 }
 
 struct Shared {
@@ -94,8 +102,8 @@ impl NetworkSource {
         let shared = Arc::new(Shared {
             buf: Mutex::new(BufState {
                 packets: BTreeMap::new(),
-                next_seq: 0,
-                need_resync: true,
+                newest: None,
+                consumed_seq: None,
             }),
             cv: Condvar::new(),
             closed: AtomicBool::new(false),
@@ -148,78 +156,42 @@ impl NetworkSource {
         self.settings.take_volume_update()
     }
 
-    /// Pull the next in-order packet for the active source, skipping ones lost.
-    /// Blocks while there's nothing to play. Returns `None` only if the receiver
-    /// socket died.
-    fn pull_next(&mut self) -> Option<AudioPacket> {
+    /// Pull the earliest buffered packet for the active source, blocking until one
+    /// is available or `timeout` elapses. Returns `None` if the receiver socket
+    /// died or nothing arrived in time. Play timing is the caller's job.
+    fn pull_next(&mut self, timeout: Duration) -> Option<AudioPacket> {
+        let deadline = std::time::Instant::now() + timeout;
         let mut bs = self.shared.buf.lock().unwrap();
         loop {
             if self.shared.closed.load(Ordering::Relaxed) {
                 return None;
             }
-            // Nothing selected (or Off): wait for a selection / packets.
-            if self.shared.active_source_id.load(Ordering::Relaxed) == 0 {
-                bs = self.shared.cv.wait(bs).unwrap();
-                continue;
-            }
-
-            // Just switched sources: adopt the earliest buffered seq.
-            if bs.need_resync {
-                if let Some((&seq, _)) = bs.packets.iter().next() {
-                    bs.next_seq = seq;
-                    bs.need_resync = false;
-                } else {
-                    bs = self.shared.cv.wait(bs).unwrap();
-                    continue;
-                }
-            }
-
-            // Discard anything older than what we're waiting for.
-            while let Some(&k) = bs.packets.keys().next() {
-                if k < bs.next_seq {
-                    bs.packets.remove(&k);
-                } else {
-                    break;
-                }
-            }
-
-            let want = bs.next_seq;
-            if let Some(pkt) = bs.packets.remove(&want) {
-                bs.next_seq = want + 1;
+            // A source is selected and a packet is buffered: take the earliest.
+            if self.shared.active_source_id.load(Ordering::Relaxed) != 0
+                && let Some((_play_at, pkt)) = bs.packets.pop_first()
+            {
+                // Remember we've taken this seq, so its redundant copies arriving
+                // later are ignored instead of re-buffered and counted late.
+                bs.consumed_seq = Some(bs.consumed_seq.map_or(pkt.seq, |c| c.max(pkt.seq)));
                 self.metrics.set_jitter_buffer_len(bs.packets.len());
                 return Some(pkt);
             }
-
-            match bs.packets.keys().next().copied() {
-                // A later packet is here but ours isn't: give it a jitter window,
-                // then declare it lost and jump ahead.
-                Some(_) => {
-                    let (guard, res) = self
-                        .shared
-                        .cv
-                        .wait_timeout(bs, Duration::from_millis(JITTER_WAIT_MS))
-                        .unwrap();
-                    bs = guard;
-                    if res.timed_out()
-                        && !bs.packets.contains_key(&bs.next_seq)
-                        && let Some(&next_present) = bs.packets.keys().next()
-                    {
-                        self.metrics.record_lost(next_present - bs.next_seq);
-                        bs.next_seq = next_present;
-                    }
-                }
-                // Buffer empty: wait. Silence is normal (source paused / off); we
-                // never treat it as an error or "offline".
-                None => {
-                    bs = self.shared.cv.wait(bs).unwrap();
-                }
+            // Nothing to play (no selection, or buffer empty). Silence is normal
+            // (source paused / off); wait for a packet or the deadline.
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
             }
+            let (guard, _) = self.shared.cv.wait_timeout(bs, deadline - now).unwrap();
+            bs = guard;
         }
     }
 
-    /// The next block of samples to play, released to the player a cushion ahead
-    /// of its play time on the synced server clock. Blocks until due. `None` on
-    /// a dead receiver socket or timeout.
+    /// The next block of samples for the active source: the earliest buffered
+    /// packet, decoded, tagged with its `play_at`. This is a plain jitter buffer —
+    /// it does no play-time regulation; the player loop decides when (and whether)
+    /// to append each chunk against the real output-queue depth. `None` on a dead
+    /// socket, or if nothing arrives within `duration`.
     pub fn next_samples_timeout(&mut self, duration: Duration) -> Option<PlayChunk> {
         let start = std::time::Instant::now();
         loop {
@@ -235,26 +207,19 @@ impl NetworkSource {
                 continue;
             }
 
-            let pkt = self.pull_next()?;
+            let remaining = duration.saturating_sub(start.elapsed());
+            let pkt = self.pull_next(remaining)?;
 
+            // Cheap pre-decode drop of a packet already wholly in the past (e.g. a
+            // backlog after a stall), so we don't decode what can't be played.
+            // Partial-late handling — cropping the still-on-time tail — is done by
+            // the player loop, which knows the real output-queue depth.
             let delay = self.settings.delay_ms() as f64;
-            // When to hand this packet to the player: CUSHION_MS before its
-            // (delay-adjusted) play time, so it waits in the player queue that
-            // long — the queue holds ~CUSHION_MS and can't underrun on jitter.
-            let target = pkt.play_at_ms as f64 - delay - CUSHION_MS;
-            let ahead = target - self.clock.server_now_ms();
-
-            if ahead < -CUSHION_MS {
-                // Past its intended play time. Drop it rather than play late
+            if (pkt.play_at_ms as f64 - delay + packet_duration_ms(&pkt))
+                < self.clock.server_now_ms()
+            {
                 self.metrics.record_late_drop();
                 continue;
-            }
-            if ahead > 0.0 {
-                let sleep_duration = Duration::from_millis((ahead as u64).min(MAX_SLEEP_MS));
-                if start.elapsed() + sleep_duration > duration {
-                    return None; // timeout reached
-                }
-                thread::sleep(sleep_duration);
             }
 
             return Some(PlayChunk {
@@ -266,6 +231,15 @@ impl NetworkSource {
             });
         }
     }
+}
+
+/// Duration in ms of a packet's audio, computed from its encoded size without
+/// decoding it (bytes ÷ bytes-per-frame ÷ rate).
+fn packet_duration_ms(pkt: &AudioPacket) -> f64 {
+    let channels = pkt.channels.max(1) as usize;
+    let bytes_per_frame = pkt.format.bytes_per_sample() * channels;
+    let frames = pkt.data.len().checked_div(bytes_per_frame).unwrap_or(0);
+    frames as f64 * 1000.0 / pkt.sample_rate.max(1) as f64
 }
 
 fn recv_loop(
@@ -297,7 +271,27 @@ fn recv_loop(
                     }
                     metrics.record_packet_received();
                     let mut bs = shared.buf.lock().unwrap();
-                    bs.packets.insert(pkt.seq, pkt);
+                    // Redundant copy (or straggler) of a packet we've already taken
+                    // from the buffer: we're fine, just ignore it — don't re-buffer
+                    // it and don't count it late.
+                    if bs.consumed_seq.is_some_and(|cs| pkt.seq <= cs) {
+                        continue;
+                    }
+                    // Timeline-shift detection: a packet with a newer seq but an
+                    // earlier play time than the newest we've seen means the
+                    // source re-anchored (or its lead shrank). Every buffered
+                    // packet scheduled at or after this new time belongs to the
+                    // abandoned timeline and would play out of order — drop them.
+                    if let Some((newest_seq, newest_play_at)) = bs.newest
+                        && pkt.seq > newest_seq
+                        && pkt.play_at_ms < newest_play_at
+                    {
+                        bs.packets.split_off(&pkt.play_at_ms);
+                    }
+                    if bs.newest.is_none_or(|(seq, _)| pkt.seq >= seq) {
+                        bs.newest = Some((pkt.seq, pkt.play_at_ms));
+                    }
+                    bs.packets.insert(pkt.play_at_ms, pkt);
                     while bs.packets.len() > MAX_BUFFERED {
                         if let Some(&oldest) = bs.packets.keys().next() {
                             bs.packets.remove(&oldest);
@@ -377,7 +371,8 @@ fn run_selection_watcher(
                 {
                     let mut bs = shared.buf.lock().unwrap();
                     bs.packets.clear();
-                    bs.need_resync = true;
+                    bs.newest = None;
+                    bs.consumed_seq = None;
                     metrics.set_jitter_buffer_len(0);
                 }
                 shared.cv.notify_all();
@@ -401,7 +396,8 @@ fn run_selection_watcher(
                     {
                         let mut bs = shared.buf.lock().unwrap();
                         bs.packets.clear();
-                        bs.need_resync = true;
+                        bs.newest = None;
+                        bs.consumed_seq = None;
                         metrics.set_jitter_buffer_len(0);
                     }
                     shared.cv.notify_all();
