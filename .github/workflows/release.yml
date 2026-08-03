@@ -1,5 +1,21 @@
 name: Release image
 
+# Publishes the RustCast container image to GHCR for the Home Assistant add-ons
+# (repo: confusinguser/rustcast-hass) to consume.
+#
+# Each architecture is built NATIVELY on its own runner (no QEMU cross-build):
+# amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm. buildx compiles the image
+# from ./Dockerfile with a per-arch GHA layer cache. The two per-arch images are
+# always pushed and then stitched into one multi-arch manifest:
+#   - release          -> tags :X.Y.Z, :X.Y, and :latest (only if this is the
+#                         repository's latest release), plus server/client
+#                         binaries attached to the release
+#   - push / dispatch  -> tag  :sha-<short commit>
+#
+# HA "amd64" == docker amd64, HA "aarch64" == docker arm64 — the only two arches
+# supported. The add-on references `ghcr.io/<owner>/rustcast` (no {arch}), so the
+# manifest list lets Docker resolve the right arch on pull.
+
 on:
   release:
     types: [published]
@@ -9,57 +25,123 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  # -> ghcr.io/confusinguser/rustcast
   IMAGE_NAME: ${{ github.repository_owner }}/rustcast
 
 jobs:
-  image:
-    name: build & push
-    runs-on: ubuntu-latest
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: read
+      contents: write   # upload binaries to the release
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Resolve build config
-        id: cfg
+      # Per-arch tag prefix the manifest job stitches together: the release version,
+      # or `sha-<short commit>` for a plain push / manual run.
+      - name: Resolve tag prefix
+        id: v
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
-            echo "platforms=linux/amd64,linux/arm64,linux/arm/v7,linux/386" >> "$GITHUB_OUTPUT"
-            echo "push=true" >> "$GITHUB_OUTPUT"
+            v="${{ github.event.release.tag_name }}"
+            echo "prefix=${v#v}" >> "$GITHUB_OUTPUT"
           else
-            echo "platforms=linux/arm64" >> "$GITHUB_OUTPUT"
-            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "prefix=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        if: steps.cfg.outputs.push == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
-
-      - name: Build${{ steps.cfg.outputs.push == 'true' && ' & push' || ' (validate)' }}
-        uses: docker/build-push-action@v6
+      # Native build (runs-on already matches the target arch), so no platforms:/
+      # QEMU. Cache is scoped per arch so the two runners don't clobber each other.
+      - name: Build & push per-arch image
+        uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: ${{ steps.cfg.outputs.platforms }}
-          push: ${{ steps.cfg.outputs.push }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.v.outputs.prefix }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # Pull the just-pushed image and copy the binaries out (both live in
+      # /usr/local/bin), then attach them to the release. Only on release.
+      - name: Attach binaries to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$REGISTRY/$IMAGE_NAME:${{ steps.v.outputs.prefix }}-${{ matrix.arch }}"
+          docker pull "$tag"
+          cid=$(docker create "$tag")
+          mkdir -p dist
+          docker cp "$cid:/usr/local/bin/server" "dist/rustcast-server-linux-${{ matrix.arch }}"
+          docker cp "$cid:/usr/local/bin/client" "dist/rustcast-client-linux-${{ matrix.arch }}"
+          docker rm "$cid"
+          gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+
+  # Combine the two per-arch images into multi-arch manifest lists. Those lists are
+  # what the add-on pulls; the intermediate `-amd64` / `-arm64` tags are left in the
+  # registry as build inputs.
+  manifest:
+    name: multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            v="${{ github.event.release.tag_name }}"
+            v="${v#v}"
+            tags="$v ${v%.*}"
+            # Only move :latest if GitHub considers this the latest release (this
+            # excludes prereleases and older/backport releases published later).
+            latest=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || echo "")
+            if [ "$latest" = "${{ github.event.release.tag_name }}" ]; then
+              tags="$tags latest"
+            fi
+            echo "prefix=$v" >> "$GITHUB_OUTPUT"
+            echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          else
+            p="sha-${GITHUB_SHA::7}"
+            echo "prefix=$p" >> "$GITHUB_OUTPUT"
+            echo "tags=$p" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create & push manifest lists
+        run: |
+          base="$REGISTRY/$IMAGE_NAME"
+          amd="$base:${{ steps.v.outputs.prefix }}-amd64"
+          arm="$base:${{ steps.v.outputs.prefix }}-arm64"
+          for tag in ${{ steps.v.outputs.tags }}; do
+            docker buildx imagetools create -t "$base:$tag" "$amd" "$arm"
+          done
