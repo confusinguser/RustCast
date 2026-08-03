@@ -58,6 +58,13 @@ pub const MAX_LEAD_MS: u64 = 1500;
 /// for the bincode header + IP/UDP headers) to avoid IP fragmentation.
 pub const TARGET_PCM_BYTES: usize = 1024;
 
+/// Reserved `source_id` for delay-measurement test tones. A client always accepts
+/// and plays an [`AudioPacket`] with this id — regardless of which source it has
+/// selected — on a dedicated output that mixes over any current playback. Real
+/// sources derive their id by hashing a name (see `catalog::source_id`), so this
+/// sentinel can never collide with one.
+pub const TEST_TONE_SOURCE_ID: u64 = u64::MAX;
+
 /// PCM encoding used on the wire. The server picks this per source; the client
 /// learns it from each packet, so it needs no matching flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

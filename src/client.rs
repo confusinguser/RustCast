@@ -9,6 +9,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::num::NonZero;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -22,7 +23,9 @@ use crate::metrics::{DeviceMetrics, run_telemetry_sender};
 use crate::net::bind_reuse;
 use crate::source::network::NetworkSource;
 use crate::sync::{ClientSettings, SyncTarget, SyncedClock, run_client_sync};
-use crate::wire::{ANNOUNCE_PORT, AUDIO_PORT, CONTROL_GROUP, CONTROL_PORT, ControlCommand};
+use crate::wire::{
+    ANNOUNCE_PORT, AUDIO_PORT, AudioPacket, CONTROL_GROUP, CONTROL_PORT, ControlCommand,
+};
 
 /// How often each client sends its telemetry + settings to the servers.
 const TELEMETRY_INTERVAL_MS: u64 = 100; // ~10 Hz
@@ -101,6 +104,11 @@ pub fn run_client(
     let socket = bind_reuse(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, AUDIO_PORT))
         .expect("bind audio socket");
 
+    // Delay-measurement test tones bypass the normal jitter buffer: the receiver
+    // forwards them here and a dedicated player (created below) mixes them over
+    // whatever is playing.
+    let (test_tx, test_rx) = mpsc::channel::<AudioPacket>();
+
     let mut source = NetworkSource::new(
         socket,
         settings.clone(),
@@ -109,6 +117,7 @@ pub fn run_client(
         clock.clone(),
         metrics.clone(),
         iface,
+        test_tx,
     )
     .expect("start network source");
 
@@ -166,6 +175,18 @@ pub fn run_client(
         .open_stream()
         .expect("open default audio stream");
     let player = rodio::Player::connect_new(handle.mixer());
+
+    // A second player on the same mixer for delay-measurement test tones, so they
+    // mix over (rather than interrupt) any current playback. Fed by the receiver
+    // via `test_rx`; scheduled against the synced clock in its own thread.
+    {
+        let test_player = rodio::Player::connect_new(handle.mixer());
+        let clock = clock.clone();
+        thread::Builder::new()
+            .name("test-tone".into())
+            .spawn(move || run_test_player(test_rx, clock, test_player, out_channels))
+            .expect("spawn test-tone player");
+    }
 
     println!("Ready; waiting for a source selection from the web UI.");
 
@@ -270,6 +291,58 @@ pub fn run_client(
         ));
         metrics.record_append(n);
         started = true;
+    }
+}
+
+/// Plays delay-measurement test tones on their own mixer output. Receives test
+/// `AudioPacket`s from the network receiver, waits until each one's `play_at` on
+/// the synced clock, and appends it — replicated across all output channels so it
+/// is audible regardless of the routing map. Mixing over any current source
+/// playback is fine: the analyzer isolates the tone by its distinct frequency.
+///
+/// If the clock isn't warmed up yet (e.g. a brand-new idle client), the tone is
+/// played immediately as a best effort; the idle keep-warm sync normally has the
+/// clock ready well before a test runs.
+fn run_test_player(
+    rx: mpsc::Receiver<AudioPacket>,
+    clock: Arc<SyncedClock>,
+    test_player: rodio::Player,
+    out_channels: u16,
+) {
+    let ch = out_channels.max(1) as usize;
+    for pkt in rx {
+        let mono = pkt.format.decode(&pkt.data);
+        if mono.is_empty() {
+            continue;
+        }
+        // Wait until the scheduled play time on the shared server clock.
+        if clock.is_initialized() {
+            loop {
+                let wait = pkt.play_at_ms as f64 - clock.server_now_ms();
+                if wait <= 1.0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(wait.min(50.0) as u64));
+            }
+        }
+        let (Some(channels), Some(sample_rate)) =
+            (NonZero::new(out_channels), SampleRate::new(pkt.sample_rate))
+        else {
+            continue;
+        };
+        // Replicate mono → every output channel so the tone plays on all speakers
+        // of a multi-channel device.
+        let mut interleaved = Vec::with_capacity(mono.len() * ch);
+        for s in mono {
+            for _ in 0..ch {
+                interleaved.push(s);
+            }
+        }
+        test_player.append(rodio::buffer::SamplesBuffer::new(
+            channels,
+            sample_rate,
+            interleaved,
+        ));
     }
 }
 

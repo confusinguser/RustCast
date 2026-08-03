@@ -3,6 +3,7 @@ import { SideNav, TABS } from "./components/SideNav";
 import { ClientsTab } from "./components/ClientsTab";
 import { BuffersTab } from "./components/BuffersTab";
 import { SyncTab } from "./components/SyncTab";
+import { DelayTab } from "./components/DelayTab";
 import { SettingsTab } from "./components/SettingsTab";
 import { ClientModal } from "./components/ClientModal";
 import { SourceModal } from "./components/SourceModal";
@@ -283,6 +284,7 @@ export function App() {
               clockOffset={clockOffset}
             />
           )}
+          {tab === "delay" && <DelayTab clients={sortedClients} />}
           {tab === "settings" && <SettingsTab />}
         </div>
       </main>

@@ -99,6 +99,13 @@ export const ICONS = {
       <path d="M5 12H2a10 10 0 0 0 20 0h-3" />
     </>
   ),
+  timer: (
+    <>
+      <line x1="10" x2="14" y1="2" y2="2" />
+      <line x1="12" x2="15" y1="14" y2="11" />
+      <circle cx="12" cy="14" r="8" />
+    </>
+  ),
 } as const;
 
 export type IconName = keyof typeof ICONS;

@@ -77,4 +77,39 @@ export interface SendParams {
 
 export type Status = "playing" | "no-audio" | "offline" | "no-listeners" | "error";
 
-export type TabId = "clients" | "buffers" | "sync" | "settings";
+export type TabId = "clients" | "buffers" | "sync" | "delay" | "settings";
+
+// ---- delay measurement (src/api.rs delaytest endpoints) ------------------
+
+/** Per-speaker frequency assignment returned by POST /api/delaytest/run. */
+export interface DelayRunAssignment {
+  client_id: string;
+  freq_hz: number;
+  /** False = client IP unknown (offline); no tone emitted, excluded from analysis. */
+  reachable: boolean;
+}
+
+/** Response of POST /api/delaytest/run: the emitted schedule + a handle to analyze. */
+export interface DelayRunResponse {
+  test_id: string;
+  play_at_ms: number;
+  burst_count: number;
+  burst_spacing_ms: number;
+  burst_ms: number;
+  assignments: DelayRunAssignment[];
+}
+
+/** One speaker's measured delay (POST /api/delaytest/analyze). `null` = not located. */
+export interface SpeakerDelay {
+  client_id: string;
+  onset_ms: number | null;
+  relative_delay_ms: number | null;
+  absolute_delay_ms: number | null;
+  confidence: number;
+}
+
+/** Response of POST /api/delaytest/analyze. */
+export interface DelayTestResult {
+  fastest_client_id: string | null;
+  results: SpeakerDelay[];
+}

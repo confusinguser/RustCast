@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use std::time::Duration;
 use crate::catalog::CatalogStore;
 use crate::metrics::DeviceMetrics;
 use crate::sync::{ClientSettings, SyncTarget, SyncedClock};
-use crate::wire::AudioPacket;
+use crate::wire::{AudioPacket, TEST_TONE_SOURCE_ID};
 
 /// Cap on buffered packets, so a stalled consumer can't grow memory without
 /// bound. At realtime pacing the buffer holds only ~the server's lead.
@@ -89,6 +90,7 @@ impl NetworkSource {
     /// Start receiving on `socket` (bound to the audio port, not yet joined to
     /// any group). Spawns the receiver and the selection watcher; returns at
     /// once (nothing plays until a source is selected).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         socket: UdpSocket,
         settings: Arc<ClientSettings>,
@@ -97,6 +99,7 @@ impl NetworkSource {
         clock: Arc<SyncedClock>,
         metrics: Arc<DeviceMetrics>,
         iface: Ipv4Addr,
+        test_tx: Sender<AudioPacket>,
     ) -> std::io::Result<Self> {
         let socket = Arc::new(socket);
         let shared = Arc::new(Shared {
@@ -117,7 +120,7 @@ impl NetworkSource {
             let clock = clock.clone();
             thread::Builder::new()
                 .name("net-recv".into())
-                .spawn(move || recv_loop(socket, shared, clock, metrics))?
+                .spawn(move || recv_loop(socket, shared, clock, metrics, test_tx))?
         };
 
         let watcher = {
@@ -233,6 +236,18 @@ impl NetworkSource {
     }
 }
 
+/// A deterministic server (lowest IP) from the catalog to keep time-syncing
+/// against while idle, so the clock stays warm for delay-test tones. Choosing the
+/// lowest IP makes every idle client pick the *same* server, so their clocks stay
+/// mutually consistent. `None` if the catalog is empty.
+fn idle_sync_server(catalog: &CatalogStore) -> Option<(Ipv4Addr, u16)> {
+    catalog
+        .snapshot()
+        .into_iter()
+        .map(|rs| (rs.server_ip, rs.sync_port))
+        .min_by_key(|(ip, _)| u32::from(*ip))
+}
+
 /// Duration in ms of a packet's audio, computed from its encoded size without
 /// decoding it (bytes ÷ bytes-per-frame ÷ rate).
 fn packet_duration_ms(pkt: &AudioPacket) -> f64 {
@@ -247,11 +262,22 @@ fn recv_loop(
     shared: Arc<Shared>,
     clock: Arc<SyncedClock>,
     metrics: Arc<DeviceMetrics>,
+    test_tx: Sender<AudioPacket>,
 ) {
     let mut buf = [0u8; 65536];
     loop {
         match socket.recv_from(&mut buf) {
             Ok((n, _addr)) => {
+                let Ok(pkt) = bincode::deserialize::<AudioPacket>(&buf[..n]) else {
+                    continue;
+                };
+                // Delay-measurement test tones are accepted regardless of the
+                // selected source (and even when idle) and handed to the dedicated
+                // test player, which mixes them over any current playback.
+                if pkt.source_id == TEST_TONE_SOURCE_ID {
+                    let _ = test_tx.send(pkt);
+                    continue;
+                }
                 let active = shared.active_source_id.load(Ordering::Relaxed);
                 if active == 0 {
                     continue; // nothing selected: ignore all audio
@@ -263,7 +289,7 @@ fn recv_loop(
                 if !clock.is_initialized() {
                     continue;
                 }
-                if let Ok(pkt) = bincode::deserialize::<AudioPacket>(&buf[..n]) {
+                {
                     // Reject packets from a source we aren't currently playing
                     // (e.g. lingering datagrams from a group we just left).
                     if pkt.source_id != active {
@@ -406,8 +432,27 @@ fn run_selection_watcher(
                     }
                     joined_group = None;
                     active_id = 0;
-                    active_server = None;
-                    sync_target.clear();
+                }
+                // Keep the clock warm while idle by time-syncing against a stable
+                // catalog server (not the audio path — just the clock). This lets
+                // an idle speaker still schedule delay-measurement test tones on the
+                // shared server clock. Re-evaluated each poll so it tracks the
+                // catalog; `clock.reset()` only fires on an actual server change.
+                match idle_sync_server(&catalog) {
+                    Some((ip, port)) => {
+                        if active_server != Some(ip) {
+                            clock.reset();
+                            active_server = Some(ip);
+                        }
+                        sync_target.set(ip, port);
+                    }
+                    None => {
+                        if active_server.is_some() {
+                            clock.reset();
+                        }
+                        active_server = None;
+                        sync_target.clear();
+                    }
                 }
             }
         }

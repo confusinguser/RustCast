@@ -16,11 +16,14 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "http://localhost:8080",
-        changeOrigin: true,
+        target: "http://192.168.0.7:8080",
+        changeOrigin: false,
         // SSE stream must not be buffered.
         ws: true,
       },
     },
+    allowedHosts: [
+      "pip.ocelot-orfe.ts.net"
+    ]
   },
 });

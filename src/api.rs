@@ -4,6 +4,7 @@
 //! by the clients and read here from their telemetry; this server stores none of
 //! it. Same-origin as the API, so no CORS is needed.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,18 +12,22 @@ use std::sync::{Arc, Mutex};
 use poem::http::StatusCode;
 use poem::listener::TcpListener;
 use poem::web::sse::{Event, SSE};
-use poem::web::{Data, Html, Json, Path};
+use poem::web::{Data, Html, Json, Path, Query};
 use poem::{EndpointExt, Route, Server, delete, get, handler, post, put};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogStore;
 use crate::clients::ClientStore;
 use crate::config::{Config, LocalClientConfig, SourceConfig};
+use crate::delaytest;
 use crate::groups::GroupStore;
 use crate::metrics::{SourceMeta, TelemetryStore};
 use crate::net::set_multicast_if;
 use crate::supervisor::SourceRegistry;
-use crate::wire::{CONTROL_GROUP, CONTROL_PORT, ControlCommand, MAX_LEAD_MS, WireFormat};
+use crate::wire::{
+    AUDIO_PORT, AudioPacket, CONTROL_GROUP, CONTROL_PORT, ControlCommand, MAX_LEAD_MS,
+    TEST_TONE_SOURCE_ID, WireFormat, now_epoch_ms,
+};
 
 /// The single-page UI, compiled into the binary. Built from the Vite project in
 /// `web/` (`npm run build` inlines all JS + CSS into one self-contained file);
@@ -125,6 +130,272 @@ impl ControlSender {
             }
         }
     }
+}
+
+// --- Delay measurement ------------------------------------------------------
+//
+// The web UI records the room with the browser mic while the server plays a
+// short, distinct-frequency tone burst on each selected speaker (all sharing one
+// `play_at` timeline). The browser posts the recording back and the server
+// (`delaytest`) recovers each speaker's real playback delay. See `delaytest.rs`.
+
+/// Tone emit rate. Kept low (with s16 encoding) so one 40 ms burst fits in a
+/// single ~1.3 KB datagram — no IP fragmentation. This is the *sampling* rate of
+/// the emitted waveform only; the acoustic frequency and the mic's recording rate
+/// are independent of it.
+const TEST_TONE_RATE: u32 = 16_000;
+/// Duration of each tone burst.
+const TEST_BURST_MS: u64 = 40;
+/// Bursts emitted per speaker; the analyzer medians across them for robustness.
+const TEST_BURST_COUNT: u32 = 5;
+/// Gap between successive bursts. Must exceed twice the analyzer's search window
+/// (see `delaytest::SEARCH_MS`) so adjacent bursts never share a scan region.
+const TEST_BURST_SPACING_MS: u64 = 700;
+/// How far in the future the first burst is scheduled, giving the packets time to
+/// reach the speakers and be scheduled against their synced clocks.
+const TEST_LEADIN_MS: u64 = 1_500;
+/// Distinct per-speaker frequencies: `BASE + i*STEP` Hz. Spaced well beyond the
+/// analyzer's window bandwidth (~125 Hz) for clean separation, and kept below the
+/// tone Nyquist (8 kHz) for a practical speaker count.
+const TEST_FREQ_BASE: f64 = 1_200.0;
+const TEST_FREQ_STEP: f64 = 700.0;
+
+/// Unicasts delay-test tone bursts to individual clients. Mirrors [`ControlSender`]:
+/// one per server, its socket's multicast interface pinned so it egresses the
+/// right NIC. Sends are unicast (to a client IP), so no group membership is needed.
+pub struct TestToneEmitter {
+    sock: UdpSocket,
+}
+
+impl TestToneEmitter {
+    pub fn new(iface: Ipv4Addr) -> std::io::Result<Self> {
+        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        if iface != Ipv4Addr::UNSPECIFIED {
+            let _ = set_multicast_if(&sock, iface);
+        }
+        Ok(Self { sock })
+    }
+
+    /// Emit one speaker's whole burst sequence to `ip`, each burst timestamped so
+    /// the client plays them at the shared `first_play_at_ms + k*spacing`.
+    fn emit_speaker(&self, ip: Ipv4Addr, freq_hz: f64, first_play_at_ms: u64) {
+        let samples = delaytest::tone_burst(freq_hz, TEST_TONE_RATE, TEST_BURST_MS);
+        let data = WireFormat::S16Le.encode(&samples);
+        for k in 0..TEST_BURST_COUNT {
+            let pkt = AudioPacket {
+                source_id: TEST_TONE_SOURCE_ID,
+                seq: k as u64,
+                play_at_ms: first_play_at_ms + k as u64 * TEST_BURST_SPACING_MS,
+                sample_rate: TEST_TONE_RATE,
+                channels: 1,
+                format: WireFormat::S16Le,
+                data: data.clone(),
+                channel_ids: Vec::new(),
+            };
+            if let Ok(bytes) = bincode::serialize(&pkt) {
+                // Unicast is lossy too; a few copies (the client dedups by seq).
+                for _ in 0..3 {
+                    let _ = self.sock.send_to(&bytes, (ip, AUDIO_PORT));
+                }
+            }
+        }
+    }
+}
+
+/// Holds in-flight delay tests between `/run` (which emits the tones and records
+/// how they were scheduled) and `/analyze` (which needs that schedule to locate
+/// the tones in the recording). Entries are removed on analyze; a small cap drops
+/// tests that were started but never analyzed.
+pub struct TestRegistry {
+    next_id: AtomicU64,
+    tests: Mutex<HashMap<u64, delaytest::TestPlan>>,
+}
+
+impl TestRegistry {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            tests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, plan: delaytest::TestPlan) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut m = self.tests.lock().unwrap();
+        if m.len() >= 16 {
+            m.clear(); // stale, never-analyzed tests — drop them
+        }
+        m.insert(id, plan);
+        id
+    }
+
+    fn take(&self, id: u64) -> Option<delaytest::TestPlan> {
+        self.tests.lock().unwrap().remove(&id)
+    }
+}
+
+impl Default for TestRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Serialize)]
+struct TimeDto {
+    server_ms: u64,
+}
+
+/// The server's wall clock, for the browser's NTP-style offset estimation. The
+/// browser brackets the call with `performance.now()` to derive offset + RTT.
+#[handler]
+fn get_time() -> Json<TimeDto> {
+    Json(TimeDto {
+        server_ms: now_epoch_ms(),
+    })
+}
+
+#[derive(Deserialize)]
+struct DelayRunBody {
+    client_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DelayAssignmentDto {
+    client_id: String,
+    freq_hz: f64,
+    /// False when we don't know the client's IP (not connected) — no tone was
+    /// emitted for it and it won't appear in the analysis.
+    reachable: bool,
+}
+
+#[derive(Serialize)]
+struct DelayRunDto {
+    test_id: String,
+    play_at_ms: u64,
+    burst_count: u32,
+    burst_spacing_ms: u64,
+    burst_ms: u64,
+    assignments: Vec<DelayAssignmentDto>,
+}
+
+/// Start a delay test: assign each requested speaker a frequency, unicast its tone
+/// bursts, and remember the schedule under a `test_id` for the later `/analyze`.
+#[handler]
+fn delaytest_run(
+    Data(store): Data<&Arc<TelemetryStore>>,
+    Data(emitter): Data<&Arc<TestToneEmitter>>,
+    Data(tests): Data<&Arc<TestRegistry>>,
+    Json(body): Json<DelayRunBody>,
+) -> Json<DelayRunDto> {
+    let play_at_ms = now_epoch_ms() + TEST_LEADIN_MS;
+    let mut assignments = Vec::new();
+    let mut analyzed = Vec::new();
+    for (i, id) in body.client_ids.iter().enumerate() {
+        let freq_hz = TEST_FREQ_BASE + TEST_FREQ_STEP * i as f64;
+        let ip = store.ip_for_id(id);
+        if let Some(ip) = ip {
+            emitter.emit_speaker(ip, freq_hz, play_at_ms);
+            analyzed.push(delaytest::Assignment {
+                client_id: id.clone(),
+                freq_hz,
+            });
+        }
+        assignments.push(DelayAssignmentDto {
+            client_id: id.clone(),
+            freq_hz,
+            reachable: ip.is_some(),
+        });
+    }
+    let test_id = tests.insert(delaytest::TestPlan {
+        play_at_ms,
+        burst_spacing_ms: TEST_BURST_SPACING_MS,
+        burst_count: TEST_BURST_COUNT,
+        burst_ms: TEST_BURST_MS,
+        assignments: analyzed,
+    });
+    Json(DelayRunDto {
+        test_id: test_id.to_string(),
+        play_at_ms,
+        burst_count: TEST_BURST_COUNT,
+        burst_spacing_ms: TEST_BURST_SPACING_MS,
+        burst_ms: TEST_BURST_MS,
+        assignments,
+    })
+}
+
+#[derive(Deserialize)]
+struct AnalyzeQuery {
+    test_id: String,
+    /// Sample rate of the posted recording (the browser's AudioContext rate).
+    sample_rate: u32,
+    /// Server-clock time (ms) of the recording's first sample.
+    capture_start_ms: f64,
+}
+
+#[derive(Serialize)]
+struct SpeakerResultDto {
+    client_id: String,
+    /// `null` when the tone couldn't be located in the recording.
+    onset_ms: Option<f64>,
+    relative_delay_ms: Option<f64>,
+    absolute_delay_ms: Option<f64>,
+    confidence: f64,
+}
+
+#[derive(Serialize)]
+struct DelayAnalyzeDto {
+    fastest_client_id: Option<String>,
+    results: Vec<SpeakerResultDto>,
+}
+
+/// Analyze a posted recording (raw f32 little-endian mono PCM in the body) against
+/// a previously-started test, returning each speaker's measured delay.
+#[handler]
+fn delaytest_analyze(
+    Query(q): Query<AnalyzeQuery>,
+    Data(tests): Data<&Arc<TestRegistry>>,
+    body: Vec<u8>,
+) -> poem::Result<Json<DelayAnalyzeDto>> {
+    let test_id: u64 = q
+        .test_id
+        .parse()
+        .map_err(|_| poem::Error::from_status(StatusCode::BAD_REQUEST))?;
+    if q.sample_rate == 0 || !body.len().is_multiple_of(4) {
+        return Err(poem::Error::from_status(StatusCode::BAD_REQUEST));
+    }
+    let plan = tests
+        .take(test_id)
+        .ok_or_else(|| poem::Error::from_status(StatusCode::NOT_FOUND))?;
+    let pcm: Vec<f32> = body
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let results = delaytest::analyze(&pcm, q.sample_rate, &plan, q.capture_start_ms);
+    let fastest_client_id = results
+        .iter()
+        .filter(|r| r.confidence > 0.0 && r.absolute_delay_ms.is_finite())
+        .min_by(|a, b| a.absolute_delay_ms.total_cmp(&b.absolute_delay_ms))
+        .map(|r| r.client_id.clone());
+    let results = results
+        .into_iter()
+        .map(|r| SpeakerResultDto {
+            client_id: r.client_id,
+            onset_ms: r.onset_ms.is_finite().then_some(r.onset_ms),
+            relative_delay_ms: r
+                .relative_delay_ms
+                .is_finite()
+                .then_some(r.relative_delay_ms),
+            absolute_delay_ms: r
+                .absolute_delay_ms
+                .is_finite()
+                .then_some(r.absolute_delay_ms),
+            confidence: r.confidence,
+        })
+        .collect();
+    Ok(Json(DelayAnalyzeDto {
+        fastest_client_id,
+        results,
+    }))
 }
 
 /// A short, stable format label for the UI.
@@ -825,6 +1096,7 @@ pub fn run(
     clients_store: Arc<ClientStore>,
     groups_store: Arc<GroupStore>,
     control: Arc<ControlSender>,
+    test_emitter: Arc<TestToneEmitter>,
     registry: Arc<SourceRegistry>,
     config: Arc<Mutex<Config>>,
     config_path: String,
@@ -852,11 +1124,16 @@ pub fn run(
             .at("/api/sources/:id", put(update_source).delete(delete_source))
             .at("/api/sources/:id/send", put(set_send))
             .at("/api/sources/:id/reanchor", post(reanchor_source))
+            .at("/api/time", get(get_time))
+            .at("/api/delaytest/run", post(delaytest_run))
+            .at("/api/delaytest/analyze", post(delaytest_analyze))
             .data(catalog)
             .data(telemetry)
             .data(clients_store)
             .data(groups_store)
             .data(control)
+            .data(test_emitter)
+            .data(Arc::new(TestRegistry::new()))
             .data(registry)
             .data(config)
             .data(Arc::new(config_path))

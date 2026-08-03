@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 
-use rustcast::api::{self, ControlSender, LocalClientCtl};
+use rustcast::api::{self, ControlSender, LocalClientCtl, TestToneEmitter};
 use rustcast::catalog::{
     CatalogStore, EntriesProvider, run_catalog_announcer, run_catalog_receiver,
     run_catalog_responder,
@@ -107,6 +107,8 @@ fn main() {
     let catalog_store = Arc::new(CatalogStore::new());
     let telemetry = Arc::new(TelemetryStore::new());
     let control = Arc::new(ControlSender::new(iface).expect("bind control socket"));
+    // Unicasts delay-measurement test tones to individual speakers.
+    let test_emitter = Arc::new(TestToneEmitter::new(iface).expect("bind test-tone socket"));
     // Durable per-client settings, keyed by device id.
     let clients_store = Arc::new(ClientStore::load(CLIENTS_JSON));
     // Durable client groups.
@@ -132,6 +134,7 @@ fn main() {
         let clients = clients_store.clone();
         let groups = groups_store.clone();
         let control = control.clone();
+        let test_emitter = test_emitter.clone();
         let registry = registry.clone();
         let config = config.clone();
         let config_path = config_path.clone();
@@ -144,6 +147,7 @@ fn main() {
                 clients,
                 groups,
                 control,
+                test_emitter,
                 registry,
                 config,
                 config_path,

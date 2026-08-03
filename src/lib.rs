@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod client;
 pub mod clients;
 pub mod config;
+pub mod delaytest;
 pub mod groups;
 pub mod metrics;
 pub mod net;

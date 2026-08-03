@@ -6,6 +6,7 @@ export const TABS: { id: TabId; icon: IconName; label: string }[] = [
   { id: "clients", icon: "speaker", label: "Clients" },
   { id: "buffers", icon: "graph", label: "Buffers" },
   { id: "sync", icon: "clock", label: "Sync" },
+  { id: "delay", icon: "timer", label: "Delay" },
   { id: "settings", icon: "gear", label: "Settings" },
 ];
 
